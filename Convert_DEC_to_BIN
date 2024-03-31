@@ -1,0 +1,33 @@
+// custom Function for google Sheets, helping meintain authorised dongleIds
+/** @OnlyCurrentDoc */
+/**
+ * Wandelt eine Dezimalzahl in eine 24-Bit-Binärzahl um und berechnet anschließend Parität Bits Even(1) & Odd(26)
+ *
+ * @param {number} dec Die umzuwandelnde Dezimalzahl.
+ * @return Die 26-Bit-Binärzahl als String.
+ * @customfunction
+ */
+function DEC_TO_BIN26(dec) {
+  if (dec < 0 || dec > 16777215) { // 16777215 ist die maximale Dezimalzahl, die in 24 Bits dargestellt werden kann (2^24 - 1).
+    throw new Error('Die Zahl liegt außerhalb des gültigen Bereichs (0 - 16.777.215).');
+  }
+  var bin = dec.toString(2); // Dezimalzahl in Binär umwandeln.
+  var paddedBin = bin.padStart(24, '0'); // Mit führenden Nullen auf 24 Bits auffüllen.
+  
+  // Teile den String in zwei Hälften
+  var firstPart = paddedBin.slice(0, paddedBin.length - 12);
+  var secondPart = paddedBin.slice(paddedBin.length - 12);
+
+  // Zähle die Einsen in beiden Teilen
+  var countOnesFirstPart = (firstPart.match(/1/g) || []).length;
+  var countOnesSecondPart = (secondPart.match(/1/g) || []).length;
+  
+  // Berechne die Paritätsbits
+  var evenParityBit = countOnesSecondPart % 2 == 0 ? '1' : '0'; // Even Parität für den zweiten Teil
+  var oddParityBit = countOnesFirstPart % 2 != 0 ? '1' : '0'; // Odd Parität für den ersten Teil
+  
+  // Kombiniere die Teile mit den Paritätsbits
+  var binWithParity = oddParityBit + firstPart + secondPart + evenParityBit;
+  
+  return binWithParity;
+}
