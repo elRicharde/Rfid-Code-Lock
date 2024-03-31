@@ -1,0 +1,80 @@
+// google Script used as WebApp
+function doGet(e) {
+// Die Funktion liefert alle Dongles aus Spalte C
+
+  const spreadsheet_id = 'put your Sheet Id here';
+  const spreadsheetname_db_pa = 'Dongle Ids Technikecke';  // Liste der Authorisierten DongleIds für die PA
+  const spreadsheetname_log_pa = 'Log Technikecke';  // Log Zugriffe RfId-Schloss für die PA  
+
+
+
+  try {
+
+    var spreadsheetname;
+    var sheetobj;
+    var range;
+    var column_vals;
+    var dongle_id_vals;
+    var jsonData;
+    var date;
+    var time;
+    var dongle_id;
+    var name = ''; // Initialisiere den Namen als leeren String
+
+    var action = e.parameter.action;
+
+// Lese alle Dongles welche für die Technikecke Authorisiert sind
+    if (action == 'read_pa'){
+      
+      sheetobj = SpreadsheetApp.openById(spreadsheet_id).getSheetByName(spreadsheetname_db_pa);
+      range = sheetobj.getRange('C2:C'); // Wählt Spalte C ab Zeile 2 bis zum Ende
+      column_vals = range.getValues();
+      dongle_id_vals = column_vals.filter(function(row) { return row[0] !== ''; }); // Filtert leere Zeilen
+      
+      jsonData = JSON.stringify(dongle_id_vals);
+      return ContentService.createTextOutput(jsonData)
+        .setMimeType(ContentService.MimeType.JSON);
+    
+
+    } else if (action == 'write_log_pa') {
+// Log für RfId Schloss Technikecke schreiben  
+
+      // Parameter-Values in Strings wandeln (ohne Überprüfung)    
+      date = String(e.parameter.date);
+      time = String(e.parameter.time);
+      access = String(e.parameter.access);
+      dongle_id = String(e.parameter.dongle_id); 
+
+      // Hole das Blatt mit den Dongle-IDs und Namen
+      var idSheet = SpreadsheetApp.openById(spreadsheet_id).getSheetByName(spreadsheetname_db_pa);
+      var idRange = idSheet.getRange('C2:A' + idSheet.getLastRow()); // IDs in Spalte C, Namen in Spalte A
+      var idValues = idRange.getValues();
+
+      // Suche den Namen zur Dongle-ID, wird keiner gefunden bleibt der String leer
+      for (var i = 0; i < idValues.length; i++) {
+        if (idValues[i][2] === dongle_id) { // Vergleiche die Dongle-ID (Spalte C ist der dritte Eintrag im Array)
+          name = idValues[i][0]; // Weise den Namen zu (Spalte A ist der erste Eintrag im Array)
+          break; // Beende die Schleife, wenn die Dongle-ID gefunden wurde
+        }
+      }
+
+      // Sheet für das Log holen
+      sheetobj = SpreadsheetApp.openById(spreadsheet_id).getSheetByName(spreadsheetname_log_pa);
+
+      // Log-Zeile anfügen
+      sheetobj.appendRow([new Date(), date, time, access, dongle_id, name]);
+
+      return ContentService.createTextOutput(JSON.stringify({ success: true, message: 'Log-Eintrag erfolgreich hinzugefügt.' }))
+        .setMimeType(ContentService.MimeType.JSON);
+
+    } else { 
+// action hat ein falschen oder keinen Wert
+        return ContentService.createTextOutput(JSON.stringify({ success: false, message: 'Ungültiger oder fehlender Action-Parameter.' }))
+          .setMimeType(ContentService.MimeType.JSON);
+    }
+  } catch (error){
+      return ContentService.createTextOutput(JSON.stringify({ success: false, message: 'Fehler: ' + error.message }))
+        .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
