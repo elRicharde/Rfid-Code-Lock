@@ -3,6 +3,10 @@
 
 #include <Arduino.h>  // Include the Arduino core library for String type
 
+// MasterKeyCard und MagicWord 
+constexpr const char OPEN_FOR_ALL_DONGLES[21] = "YOUR_MAGIC_WORDS";
+constexpr const char DONGLE_MASTER_CARD_UPDATE_DB[27] = "MASTER_KEY_CARD_ID";
+
 // Wifi Daten as Constants
 constexpr char SSID[10] = "YOUR SSID";
 constexpr char WIFI_PASSWORD[75] = "YOUR WIFI PW";
