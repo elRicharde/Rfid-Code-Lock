@@ -24,6 +24,7 @@ durch die Steckerverbinder ändern sich die Kabelfarben am Board wie folgt:
 #include "time.h"
 #include <Preferences.h>
 #include "freertos/semphr.h"
+#include "ArduinoBuzzerSoundsRG.h"
 
 constexpr long GMT_OFFSET_SEC = 3600;
 constexpr int DAYLIGHT_OFFSET_SEC = 3600;
@@ -42,7 +43,6 @@ constexpr int INTERRUPT_IO_PIN_2 = 8;
 constexpr int SWITCHDURATION_ms = 250;
 constexpr int DOOR_IS_CLOSED = 0;
 constexpr int DOOR_IS_OPEN = 1;
-
 
 
 enum CharArraySizes {
@@ -70,19 +70,29 @@ Preferences preferencesLog;  // for access to persistent memory of the ESP32 - m
 JsonDocument ramDonglesDoc;  // JSON Doc for handling DongleIds in string like array as global var in ram
 JsonArray ramDonglesArr = ramDonglesDoc.as<JsonArray>(); // convert to "linked" array
 
-
+BuzzerSoundsRgNonRtos* buzzerSounds;
 
 // =============================================================================================================================
 // Debugging Control ===========================================================================================================
 DebugService* debugService;                                 
 struct DebugFlags {                                         
-  static constexpr bool DEBUG_MODE = true;    // Muss immer true sein, wenn mindestens ein anderes Flag true ist        
-  static constexpr bool WIFI_LOGGING = true;                
-  static constexpr bool FETCH_AND_STORE_DONGLE_IDS = true;
-  static constexpr bool FETCH_AND_STORE_DONGLE_IDS_DETAIL = true;
-  static constexpr bool DOOR_STATE = true;
-  static constexpr bool DONGLE_SCAN = true;
-  static constexpr bool DONGLE_AUTH = true;
+  // static constexpr bool DEBUG_MODE = true;    // Muss immer true sein, wenn mindestens ein anderes Flag true ist        
+  // static constexpr bool WIFI_LOGGING = true;                
+  // static constexpr bool FETCH_AND_STORE_DONGLE_IDS = true;
+  // static constexpr bool FETCH_AND_STORE_DONGLE_IDS_DETAIL = true;
+  // static constexpr bool DOOR_STATE = true;
+  // static constexpr bool DONGLE_SCAN = true;
+  // static constexpr bool DONGLE_AUTH = true;
+  // static constexpr bool SEND_STORED_DONLGE_LOG_ENTRIES = true;
+
+  static constexpr bool DEBUG_MODE = false;    // Muss immer true sein, wenn mindestens ein anderes Flag true ist        
+  static constexpr bool WIFI_LOGGING = false;                
+  static constexpr bool FETCH_AND_STORE_DONGLE_IDS = false;
+  static constexpr bool FETCH_AND_STORE_DONGLE_IDS_DETAIL = false;
+  static constexpr bool DOOR_STATE = false;
+  static constexpr bool DONGLE_SCAN = false;
+  static constexpr bool DONGLE_AUTH = false;
+  static constexpr bool SEND_STORED_DONLGE_LOG_ENTRIES = false;
 };                                                          
 // extern defefinition needed for linker, obsolete from c++17 with inline in struct
 constexpr bool DebugFlags::DEBUG_MODE;    
@@ -92,6 +102,7 @@ constexpr bool DebugFlags::FETCH_AND_STORE_DONGLE_IDS_DETAIL;
 constexpr bool DebugFlags::DOOR_STATE;
 constexpr bool DebugFlags::DONGLE_SCAN;
 constexpr bool DebugFlags::DONGLE_AUTH;
+constexpr bool DebugFlags::SEND_STORED_DONLGE_LOG_ENTRIES;
 // Debugging Control ===========================================================================================================
 // =============================================================================================================================
 
@@ -173,11 +184,10 @@ void setup() {
     debugService->SerialPrintln_ifDebug(DebugFlags::WIFI_LOGGING, "nicht mit dem Internet Verbunden");  // connect and reconnect take place automatically depending on WiFi availability
   }
 
-
+  buzzerSounds = new BuzzerSoundsRgNonRtos(BUZZERPIN); // create instance of BuzzerSoundsRgRtos
   // Init and get the time
   configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, TIME_SERVER_1, TIME_SERVER_2, TIME_SERVER_3);
 
-  // pinMode(Buzzer, OUTPUT);    // Pin for Buzzer
   pinMode(UNLOCKPIN, OUTPUT);           // Pin for Unlock
   pinMode(DOOR_STATE_PIN, INPUT_PULLUP);  // Pin for Unlock (Open = 1 / closed = 0)
 
@@ -324,7 +334,12 @@ void fetchAndStoreDongleIds() {
   // Step 1 - read the save Dongle Ids from persistent memory as JSON-String-Array
   String persOfflineDonglesJson = preferencesDongles.getString(PERS_MEM_DONGLE_IDS, "[]");  // read stored dongleIds in string-like array ([key], [default])
   JsonDocument persOfflineDonglesDoc;                                               // JSON Doc for handling DongleIds in string like array
-  deserializeJson(persOfflineDonglesDoc, persOfflineDonglesJson);                   // deserialize (parse persOfflineDonglesJson to fill persOfflineDonglesDoc with its content)
+  DeserializationError error = deserializeJson(persOfflineDonglesDoc, persOfflineDonglesJson);     // deserialize (parse persOfflineDonglesJson to fill persOfflineDonglesDoc with its content)
+  if (error) {
+    debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Failed to deserialize persisted dongles: ", error.f_str());
+    // Handle error: you might choose to clear the document or return
+    persOfflineDonglesDoc.clear();
+  }  
   JsonArray persOfflineDonglesArr = persOfflineDonglesDoc.as<JsonArray>();          // convert to "linked" array
 
   debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Dongles Read from PersMem to JSON");
@@ -351,13 +366,19 @@ void fetchAndStoreDongleIds() {
     }
     preferencesDongles.end();   // will set the persistent Memory for Dongles to Read_Only again
     http.end();
+    buzzerSounds->playSound(BuzzerSoundsRgBase::SoundType::SOS); // http error
     return;
   }
 
   debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Start Deserialize Donges from gSheets");
   String payload = http.getString();                              // get Answer as String
   JsonDocument onlineDonglesDoc;                                  // JSON Doc for handling DongleIds in string like array
-  deserializeJson(onlineDonglesDoc, payload);                     // deserialize (parse payload to fill onlineDonglesDoc with its content)
+  error = deserializeJson(onlineDonglesDoc, payload);             // deserialize (parse payload to fill onlineDonglesDoc with its content)
+  if (error) {
+    debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Failed to deserialize online dongles: ", error.f_str());
+    // Handle error
+    onlineDonglesDoc.clear();   // ToDo - this seems incomplete
+  }  
   JsonArray onlineDonglesArr = onlineDonglesDoc.as<JsonArray>();  // convert to "linked" array
 
   if (DebugFlags::FETCH_AND_STORE_DONGLE_IDS_DETAIL) {
@@ -399,6 +420,7 @@ void fetchAndStoreDongleIds() {
       }
       xSemaphoreGive(mutexPersistentDongleStorage);
       debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Mutex PersDongleStore free");
+      buzzerSounds->playSound(BuzzerSoundsRgBase::SoundType::OK); // Update Dongles Done, we are ready
     }
   } else {
     debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "read dongleIds from gsheet are the same as in pers. Memory, write PersMem to Ram");
@@ -441,7 +463,8 @@ void trackDoorStateChange(){
       safeCopyStringToChar("door_is_closed", logEntry.access, 15);
       safeCopyStringToChar("doorstate", logEntry.dongle_id, 10);
 
-      //PostLogToQueue("door_is_closed", "doorstate"); //ERSETZEN!!!! TODO
+      PostLog(logEntry);
+
     } else if (DoorStateMemory == DOOR_IS_OPEN) {
       debugService->SerialPrintln_ifDebug(DebugFlags::DOOR_STATE, "PostLogToQueue(door_is_open, doorstate)");
       getCurrentDateTime(logEntry.date, logEntry.time);
@@ -449,7 +472,7 @@ void trackDoorStateChange(){
       safeCopyStringToChar("door_is_open", logEntry.access, 13);
       safeCopyStringToChar("doorstate", logEntry.dongle_id, 10);
 
-      //PostLogToQueue("door_is_open", "doorstate");     // ERSETZEN!!!! TODO
+      PostLog(logEntry);
     } else {
       // nothing here, shouldn´t happen
     }
@@ -466,13 +489,14 @@ void PostLog(LogEntryStruct &logEntry) {
   if (sendStoredLogEntries()){
     // all old saved logs are sent, so send the new one too
     if (sendLogEntryViaHttp(logEntry)){
-      return; // Sending Successfull, nothing to do here
+      // return; // Sending Successfull, nothing to do here
     } else {
       saveFailedLogEntry(logEntry);
     }
   } else {
     saveFailedLogEntry(logEntry);
   }
+
 }  // PostLog
 
 
@@ -496,6 +520,7 @@ bool sendLogEntryViaHttp(LogEntryStruct &logEntry) {
 
 
 bool sendStoredLogEntries() {
+  debugService->SerialPrintln_ifDebug(DebugFlags::SEND_STORED_DONLGE_LOG_ENTRIES, "Start Method sendStoredLogEntries()");
   // check if there is unsent log entries in memory and send them, use JSON for handling keys
   LogEntryStruct logEntry;
   // preferences object for log
@@ -503,7 +528,14 @@ bool sendStoredLogEntries() {
   
   JsonDocument doc;   // JSON Doc for handling keys in string like array
   String keyArrayStr = preferencesLog.getString("keyArray", "[]");  // read stored logentries-keys in string-like array ([key], [default])
-  deserializeJson(doc, keyArrayStr);  // deserialize (parse keyArrayStr to fill doc with its content)
+  DeserializationError error = deserializeJson(doc, keyArrayStr);  // deserialize (parse keyArrayStr to fill doc with its content)
+  if (error) {
+    debugService->SerialPrintln_ifDebug(DebugFlags::SEND_STORED_DONLGE_LOG_ENTRIES, "Failed to deserialize keyArray: ", error.f_str());
+    // Handle error, possibly clear the stored logs
+    preferencesLog.clear();
+    preferencesLog.end();
+    return true; // Return true to prevent further attempts on corrupted data
+  }  
   JsonArray keyArray = doc.as<JsonArray>();  // convert to "linked" array
 
   if (keyArray.size() == 0) {
@@ -561,6 +593,7 @@ bool sendStoredLogEntries() {
     preferencesLog.end();
     return false; // leave function with false --> means that there are still old logs in memory
   }
+
 } // sendStoredLogEntries
 
 
@@ -593,6 +626,7 @@ void saveFailedLogEntry(LogEntryStruct &logEntry) {
         noUniqueKeyFound = true;
         break; // leave inner while, because there is a dupRec
       }
+      i++; 
     }
   }
 
@@ -632,7 +666,7 @@ void handleRFIDScanResult(){
     debugService->SerialPrintln_ifDebug(DebugFlags::DONGLE_SCAN, "scanned Dongle: " , dongleIdStr);
     if (isDongleIdAuthorized(dongleIdStr)) { 
       debugService->SerialPrintln_ifDebug(DebugFlags::DONGLE_SCAN, "PlaySound AuthOk");
-      // addSoundToQueue(BuzzerSoundsRgBase::SoundType::AuthOk); TODO
+      buzzerSounds->playSound(BuzzerSoundsRgBase::SoundType::AuthOk);
       unlock();
       debugService->SerialPrintln_ifDebug(DebugFlags::DONGLE_SCAN, "PostLogToQueue(authorised," , dongleIdStr , ")");
       getCurrentDateTime(logEntry.date, logEntry.time);
@@ -641,9 +675,10 @@ void handleRFIDScanResult(){
       safeCopyStringToChar(dongleIdStr, logEntry.dongle_id, CharArraySizes::CharArrayDongleIdSize);
 
       PostLog(logEntry);
+
     } else {
       debugService->SerialPrintln_ifDebug(DebugFlags::DONGLE_SCAN, "PlaySound NoAuth)");
-      // addSoundToQueue(BuzzerSoundsRgBase::SoundType::NoAuth);  TODO
+      buzzerSounds->playSound(BuzzerSoundsRgBase::SoundType::NoAuth);
       debugService->SerialPrintln_ifDebug(DebugFlags::DONGLE_SCAN, "PostLogToQueue(denied," , dongleIdStr , ")");
       getCurrentDateTime(logEntry.date, logEntry.time);
 
@@ -651,7 +686,6 @@ void handleRFIDScanResult(){
       safeCopyStringToChar(dongleIdStr, logEntry.dongle_id, CharArraySizes::CharArrayDongleIdSize);
 
       PostLog(logEntry);
-
     }
     
     // critical section: disabling interrupts to init their content
@@ -675,6 +709,24 @@ bool isDongleIdAuthorized(String dongleIdStr) {
     for (JsonVariant v : ramDonglesArr) {
         debugService->SerialPrintln_ifDebug(DebugFlags::DONGLE_AUTH, "CompareScan ", dongleIdStr);
         debugService->SerialPrintln_ifDebug(DebugFlags::DONGLE_AUTH, "CompareMem  ", v.as<String>());
+
+
+        // Scan MasterCard -> force Dongle DB Update
+        if (dongleIdStr.equals(DONGLE_MASTER_CARD_UPDATE_DB)) {
+            
+            // Update DB when MasterCard is Scanned, but do not open the Door :-)
+            xSemaphoreGive(mutexPersistentDongleStorage);
+            fetchAndStoreDongleIds();
+            return false;
+        }
+
+        // immer öffnen wenn die Liste "OPEN_FOR_ALL_DONGLES" enthält
+        if (v.as<String>() == OPEN_FOR_ALL_DONGLES) {
+                        
+            xSemaphoreGive(mutexPersistentDongleStorage);
+            return true;
+        }
+        // Vergleich der Dongles in DB mit Rfid-Scan
         if (dongleIdStr.equals(v.as<String>())) {
             xSemaphoreGive(mutexPersistentDongleStorage);
             return true;
