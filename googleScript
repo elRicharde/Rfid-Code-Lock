@@ -42,12 +42,12 @@ function doGet(e) {
       // Parameter-Values in Strings wandeln (ohne Überprüfung)    
       date = String(e.parameter.date);
       time = String(e.parameter.time);
-      access = String(e.parameter.access);
+      const access = String(e.parameter.access);
       dongle_id = String(e.parameter.dongle_id); 
 
       // Hole das Blatt mit den Dongle-IDs und Namen
       var idSheet = SpreadsheetApp.openById(spreadsheet_id).getSheetByName(spreadsheetname_db_pa);
-      var idRange = idSheet.getRange('C2:A' + idSheet.getLastRow()); // IDs in Spalte C, Namen in Spalte A
+      var idRange = idSheet.getRange('A2:C' + idSheet.getLastRow()); // Names in column A, IDs in column C
       var idValues = idRange.getValues();
 
       // Suche den Namen zur Dongle-ID, wird keiner gefunden bleibt der String leer

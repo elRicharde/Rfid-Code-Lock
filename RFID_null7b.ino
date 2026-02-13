@@ -32,7 +32,7 @@ constexpr const char TIME_SERVER_1[16] = "de.pool.ntp.org";
 constexpr const char TIME_SERVER_2[13] = "pool.ntp.org";
 constexpr const char TIME_SERVER_3[14] = "time.nist.gov";
                                       
-constexpr const char PERS_MEM_DONGLE_IDS[10] = "DonlgeIds";
+constexpr const char PERS_MEM_DONGLE_IDS[10] = "DongleIds";
 constexpr const char PERS_MEM_FAILED_LOGS[12] = "Failed_Logs";
 
 constexpr int BUZZERPIN = 4;
@@ -43,6 +43,10 @@ constexpr int INTERRUPT_IO_PIN_2 = 8;
 constexpr int SWITCHDURATION_ms = 250;
 constexpr int DOOR_IS_CLOSED = 0;
 constexpr int DOOR_IS_OPEN = 1;
+constexpr int WIEGAND_TIMEOUT_MS = 200;               // Timeout in ms to reset partial Wiegand reads (see loop() for design rationale)
+constexpr float DONGLE_REFRESH_INTERVAL_HOURS = 4.0;  // Periodic dongle DB refresh (range: 0.01 for testing, 0.5 - 72.0 for production)
+constexpr unsigned long DONGLE_REFRESH_INTERVAL_MS = (unsigned long)(DONGLE_REFRESH_INTERVAL_HOURS * 3600.0f * 1000.0f);
+constexpr unsigned long WIFI_RECONNECT_INTERVAL_MS = 30000;  // Check and reconnect WiFi every 30 seconds
 
 
 enum CharArraySizes {
@@ -61,14 +65,17 @@ LogEntryStruct logEntry;
 
 volatile int bitCount = 0;               // Counter for the number of bits received
 volatile unsigned long dongleValue = 0;  // Variable to store the dongle value
-int DoorStateMemory = 2;                 // DoorStateMemory Initial = 2, in use can be only 1 or 0
+int DoorStateMemory = 2;                  // DoorStateMemory Initial = 2, in use can be only 1 or 0
+volatile unsigned long lastBitTime = 0;   // Timestamp of last received Wiegand bit (for timeout detection in loop)
+unsigned long lastDongleRefreshTime = 0;  // Tracks when dongle IDs were last refreshed from Google Sheets
+unsigned long lastWifiReconnectCheck = 0; // Tracks last WiFi status check for reconnect logic
 
 
-SemaphoreHandle_t mutexPersistentDongleStorage; // Mutex für den Zugriff auf den persistenten Speicher
+SemaphoreHandle_t mutexDongleList; // Mutex protecting ramDonglesArr (the in-RAM dongle list)
 Preferences preferencesDongles;  // for access to persistent memory of the ESP32 - mem area for dongles
 Preferences preferencesLog;  // for access to persistent memory of the ESP32 - mem area for dongles
 JsonDocument ramDonglesDoc;  // JSON Doc for handling DongleIds in string like array as global var in ram
-JsonArray ramDonglesArr = ramDonglesDoc.as<JsonArray>(); // convert to "linked" array
+JsonArray ramDonglesArr; // Properly initialized in setup() after deserializing the JSON document
 
 BuzzerSoundsRgNonRtos* buzzerSounds;
 
@@ -118,14 +125,17 @@ void getCurrentDateTime(char formattedDate[11], char formattedTime[9]);
 
 bool safeCopyStringToChar(const String& source, char* dest, size_t destSize);
 
+// URL-encode a string for safe HTTP query parameters
+String urlEncode(const String& str);
+
 // check if Value is included in JsonArray
 bool arrayContains(const JsonArray& arr, const JsonVariant& value);
 
 // ISR (interrupt Service Routine) for Data0 (represents bit '0') in the Wiegand protocol
-void ISRreceiveData0();
+void IRAM_ATTR ISRreceiveData0();
 
 // ISR (Interrupt Service Routine) for Data1 (represents bit '1') in the Wiegand protocol.
-void ISRreceiveData1();
+void IRAM_ATTR ISRreceiveData1();
 
 void fetchAndStoreDongleIds();
 
@@ -151,9 +161,13 @@ void unlock();
 // SetUp ======================================================================================================================
 //=============================================================================================================================
 void setup() {
+  // Always initialize Serial and DebugService to prevent nullptr crashes.
+  // When DEBUG_MODE is false, debug calls are optimized away by the compiler (constexpr),
+  // but the instance must exist for safe method calls. Cost: ~80 bytes RAM for the mutex.
+  Serial.begin(115200);
+  debugService = DebugService::getInstance();
+
   if (DebugFlags::DEBUG_MODE) {
-    Serial.begin(115200);
-    debugService = DebugService::getInstance();
     debugService->SerialPrintln_ifDebug(DebugFlags::DEBUG_MODE, "5 seconds......");
     delay(1000);
     debugService->SerialPrintln_ifDebug(DebugFlags::DEBUG_MODE, "4 seconds.....");
@@ -206,18 +220,52 @@ void setup() {
       debugService->SerialPrintln_ifDebug(DebugFlags::DEBUG_MODE, "Das Array ramDonglesArr ist initialisiert und gültig");
   }
 
-  mutexPersistentDongleStorage = xSemaphoreCreateMutex(); // Initialisiing Mutex here
+  mutexDongleList = xSemaphoreCreateMutex();
   fetchAndStoreDongleIds();
-} //setup() 
+  lastDongleRefreshTime = millis();  // Start periodic refresh timer after initial fetch
+} //setup()
 
 
 // Loop =======================================================================================================================
 //=============================================================================================================================
 void loop() {
-  // put your main code here, to run repeatedly:
   trackDoorStateChange();
   handleRFIDScanResult();
 
+  // Reset partial RFID reads that timed out.
+  // Design: The Wiegand protocol transmits all 26 bits within ~52ms (2ms per bit).
+  // If interference or a partial read leaves bitCount between 1-25, no further scans
+  // can succeed because bitCount never reaches 26. A 200ms timeout is chosen to be
+  // well above the maximum valid transmission time while still recovering quickly.
+  if (bitCount > 0 && bitCount < 26 && millis() - lastBitTime > WIEGAND_TIMEOUT_MS) {
+    noInterrupts();
+    bitCount = 0;
+    dongleValue = 0;
+    interrupts();
+  }
+
+  // Periodic WiFi reconnect check
+  if (millis() - lastWifiReconnectCheck > WIFI_RECONNECT_INTERVAL_MS) {
+    lastWifiReconnectCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      debugService->SerialPrintln_ifDebug(DebugFlags::WIFI_LOGGING, "WiFi disconnected, attempting reconnect...");
+      WiFi.reconnect();
+    }
+  }
+
+  // Periodic dongle ID refresh from Google Sheets.
+  // Note: This briefly blocks the main loop during the HTTP call (typically 1-3s, max 20s).
+  // RFID scanning is paused during this time. For non-blocking refresh,
+  // see BACKLOG.md item 1: "Refactor HTTP calls to separate FreeRTOS task".
+  if (millis() - lastDongleRefreshTime > DONGLE_REFRESH_INTERVAL_MS) {
+    lastDongleRefreshTime = millis();
+    fetchAndStoreDongleIds();
+  }
+
+  // Yield to RTOS scheduler and reduce CPU load.
+  // RFID bits are captured by hardware interrupts (ISR) and are never missed by this delay.
+  // Door state changes occur in the seconds range; 10ms = 100 checks/s is more than sufficient.
+  delay(10);
 } // loop()
 
 
@@ -285,34 +333,34 @@ bool arrayContains(const JsonArray& arr, const JsonVariant& value) {
 } // arrayContains
 
 
-void ISRreceiveData0() {
+// IRAM_ATTR: On ESP32, ISR code must reside in Internal RAM (IRAM), not in Flash.
+// During Flash operations (e.g., Preferences writes), Flash is temporarily unavailable.
+// Without IRAM_ATTR, an interrupt during a Flash operation would try to execute code
+// from unavailable Flash memory, causing a "Guru Meditation Error" (crash).
+void IRAM_ATTR ISRreceiveData0() {
   /*
-  ISR (Interrupt Service Routine) for Data0 (represents bit '0') in the Wiegand protocol.
-  This routine is called when a FALLING interrupt occurs on the Data0 pin,
-  which corresponds to a '0' bit in the Wiegand protocol. The ISR collects the 
-  received binary bits (0 and 1) in the global variable dongleValue. A maximum of 26 bits are 
-  collected, corresponding to the usual format of Wiegand data.
+  ISR for Data0 (bit '0') in the Wiegand protocol.
+  Called on FALLING edge of the Data0 pin. Collects up to 26 bits in dongleValue.
   */
   if (bitCount < 26) {
-    dongleValue <<= 1;  // Shift the earlier bits left
+    dongleValue <<= 1;  // Shift the earlier bits left (new bit is implicitly 0)
     bitCount++;
+    lastBitTime = millis();  // millis() is ISR-safe on ESP32 (reads hardware timer)
   }
 } //ISRreceiveData0
 
 
 
-void ISRreceiveData1() {
+void IRAM_ATTR ISRreceiveData1() {
   /*
-  ISR (Interrupt Service Routine) for Data1 (represents bit '1') in the Wiegand protocol.
-  Similar to ISRreceiveData0 but for the '1' bit. This routine is called
-  when a FALLING interrupt occurs on the Data1 pin, which corresponds to a '1' bit in 
-  the Wiegand protocol. In addition to shifting the bits in dongleValue, the LSB (Least Significant Bit) 
-  of donngleValue is set to '1' to represent the received '1' bit.
+  ISR for Data1 (bit '1') in the Wiegand protocol.
+  Called on FALLING edge of the Data1 pin. Sets the LSB to represent the received '1' bit.
   */
   if (bitCount < 26) {
     dongleValue <<= 1;  // Shift the earlier bits
-    dongleValue |= 1;   // Add '1' to the LSB of dongleValue
+    dongleValue |= 1;   // Set LSB to '1'
     bitCount++;
+    lastBitTime = millis();  // millis() is ISR-safe on ESP32 (reads hardware timer)
   }
 } //ISRreceiveData1
 
@@ -354,14 +402,14 @@ void fetchAndStoreDongleIds() {
   // Check Status, if not 200 (OK) then use dongleIds from persistent memory and close all connections
   if (httpCode != 200) {  
     //String myDebugMsg = "http is " + String(httpCode);
-    debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "http is " + httpCode);
+    debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "http is ", httpCode);
     debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "HTTP Code: " , httpCode , " - " , http.errorToString(httpCode));
     if (ramDonglesArr.size() == 0) {                                                // restart without internetconnection -> use dongles from persistent memory to fill ram
-      if (xSemaphoreTake(mutexPersistentDongleStorage, pdMS_TO_TICKS(5000)) == pdTRUE) {  // Mutex anfordern
+      if (xSemaphoreTake(mutexDongleList, pdMS_TO_TICKS(5000)) == pdTRUE) {  // Mutex anfordern
         for (JsonVariant v : persOfflineDonglesArr) {
           ramDonglesArr.add(v);
         }
-        xSemaphoreGive(mutexPersistentDongleStorage);
+        xSemaphoreGive(mutexDongleList);
       }
     }
     preferencesDongles.end();   // will set the persistent Memory for Dongles to Read_Only again
@@ -412,25 +460,25 @@ void fetchAndStoreDongleIds() {
     debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Mem Cleared, putString");
     preferencesDongles.putString(PERS_MEM_DONGLE_IDS, payload);  // just safe the payload which are the online saved dongleIDs in JSON-string-format
     debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Payload as JSON Saved - ask Mutex");
-    if (xSemaphoreTake(mutexPersistentDongleStorage, portMAX_DELAY) == pdTRUE) {  // Mutex anfordern
+    if (xSemaphoreTake(mutexDongleList, portMAX_DELAY) == pdTRUE) {  // Mutex anfordern
       debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "got Mutex PersDongleStore");
       ramDonglesArr.clear();
       for (JsonVariant v : onlineDonglesArr) {
         ramDonglesArr.add(v);
       }
-      xSemaphoreGive(mutexPersistentDongleStorage);
+      xSemaphoreGive(mutexDongleList);
       debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Mutex PersDongleStore free");
       buzzerSounds->playSound(BuzzerSoundsRgBase::SoundType::OK); // Update Dongles Done, we are ready
     }
   } else {
     debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "read dongleIds from gsheet are the same as in pers. Memory, write PersMem to Ram");
     if (ramDonglesArr.size() == 0) {            
-      if (xSemaphoreTake(mutexPersistentDongleStorage, pdMS_TO_TICKS(5000)) == pdTRUE) {   // restart with internetconnection but also latest dongleIds already in persistent memory, just fill the ram
+      if (xSemaphoreTake(mutexDongleList, pdMS_TO_TICKS(5000)) == pdTRUE) {   // restart with internetconnection but also latest dongleIds already in persistent memory, just fill the ram
         debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Got Mutex");        
         for (JsonVariant v : persOfflineDonglesArr) {
           ramDonglesArr.add(v);
         }
-        xSemaphoreGive(mutexPersistentDongleStorage);
+        xSemaphoreGive(mutexDongleList);
         debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Gave Mutex Back");      
       } else {
         debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "didn´t wait forever");
@@ -448,20 +496,21 @@ void fetchAndStoreDongleIds() {
 
 
 void trackDoorStateChange(){
-  // log doorstate when changed
+  // Log door state changes (open/closed) to track physical access
   LogEntryStruct logEntry;
-  String dateString, timeString;
 
+  // Read pin once to avoid inconsistency between comparison and assignment
+  int currentDoorState = digitalRead(DOOR_STATE_PIN);
 
-  if (DoorStateMemory != digitalRead(DOOR_STATE_PIN)){
-    DoorStateMemory = digitalRead(DOOR_STATE_PIN);  
+  if (DoorStateMemory != currentDoorState){
+    DoorStateMemory = currentDoorState;
     // debouncing probably not necessary, if it is, insert here
     if (DoorStateMemory == DOOR_IS_CLOSED){
       debugService->SerialPrintln_ifDebug(DebugFlags::DOOR_STATE, "PostLogToQueue(door_is_closed, doorstate)");
       getCurrentDateTime(logEntry.date, logEntry.time);
 
-      safeCopyStringToChar("door_is_closed", logEntry.access, 15);
-      safeCopyStringToChar("doorstate", logEntry.dongle_id, 10);
+      safeCopyStringToChar("door_is_closed", logEntry.access, CharArraySizes::CharArrayAccessSize);
+      safeCopyStringToChar("doorstate", logEntry.dongle_id, CharArraySizes::CharArrayDongleIdSize);
 
       PostLog(logEntry);
 
@@ -469,12 +518,12 @@ void trackDoorStateChange(){
       debugService->SerialPrintln_ifDebug(DebugFlags::DOOR_STATE, "PostLogToQueue(door_is_open, doorstate)");
       getCurrentDateTime(logEntry.date, logEntry.time);
 
-      safeCopyStringToChar("door_is_open", logEntry.access, 13);
-      safeCopyStringToChar("doorstate", logEntry.dongle_id, 10);
+      safeCopyStringToChar("door_is_open", logEntry.access, CharArraySizes::CharArrayAccessSize);
+      safeCopyStringToChar("doorstate", logEntry.dongle_id, CharArraySizes::CharArrayDongleIdSize);
 
       PostLog(logEntry);
     } else {
-      // nothing here, shouldn´t happen
+      // nothing here, shouldn't happen
     }
   }
 } // trackDoorStateChange
@@ -501,18 +550,42 @@ void PostLog(LogEntryStruct &logEntry) {
 
 
 
+String urlEncode(const String& str) {
+  // URL-encode a string for safe use in HTTP query parameters (RFC 3986).
+  // Unreserved characters (A-Z, a-z, 0-9, '-', '_', '.', '~') pass through;
+  // all others are percent-encoded (e.g., ':' becomes '%3A').
+  String encoded;
+  encoded.reserve(str.length() + 8);  // Pre-allocate to reduce heap fragmentation
+  for (unsigned int i = 0; i < str.length(); i++) {
+    char c = str.charAt(i);
+    if (isAlphaNumeric(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += c;
+    } else {
+      char buf[4];
+      snprintf(buf, sizeof(buf), "%%%02X", (unsigned char)c);
+      encoded += buf;
+    }
+  }
+  return encoded;
+} // urlEncode
+
+
+
 bool sendLogEntryViaHttp(LogEntryStruct &logEntry) {
-  // send a log entry thru http via webApp into googleSheet
+  // Send a log entry via HTTP GET to the Google Apps Script web app
   HTTPClient http;
   String webappurl_write = String(WEB_APP_URL) + "?action=write_log_pa";
-  webappurl_write += "&date=" + String(logEntry.date) + "&time=" + String(logEntry.time) + "&access=" + String(logEntry.access) + "&dongle_id=" + String(logEntry.dongle_id);
+  webappurl_write += "&date=" + urlEncode(String(logEntry.date));
+  webappurl_write += "&time=" + urlEncode(String(logEntry.time));
+  webappurl_write += "&access=" + urlEncode(String(logEntry.access));
+  webappurl_write += "&dongle_id=" + urlEncode(String(logEntry.dongle_id));
 
   http.begin(webappurl_write);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   int httpCode = http.GET();
   http.end();
 
-  return httpCode == 200; // wenn der httpCode 200 ist, gibt die Funktion True zurück
+  return httpCode == 200;
 } //sendLogEntryViaHttp
 
 
@@ -543,7 +616,7 @@ bool sendStoredLogEntries() {
     return true; // leave function with true for success, because there is nothing left in Memory to log
   }
 
-  JsonArray keyArrayCopy = keyArray;  // save keyArray for checking if it has changed
+  int originalKeyCount = keyArray.size();  // Store count before sending, to detect partial success
 
   // loop over all keys for access to stored logs, processing is sequential and not based on key name
   int i = 0;
@@ -575,6 +648,11 @@ bool sendStoredLogEntries() {
       } else {
           break;  // leave while
       }
+    } else {
+      // Empty log entry found in persistent memory - skip to next key to prevent infinite loop.
+      // This can happen if a key exists in keyArray but its value was already removed
+      // or was never written correctly.
+      i++;
     }
   }
 
@@ -582,8 +660,8 @@ bool sendStoredLogEntries() {
     preferencesLog.remove("keyArray"); // if the array is empty, delete all keys in persistent memory
     preferencesLog.end();
     return true; // leave function with true for success
-  } else if (keyArray.size() != keyArrayCopy.size()){
-    // update the KeyArray if it still contains keys but is different to the initial read KeyArray, compare of JSON-Array not directly possible, therefore compare size
+  } else if (keyArray.size() != originalKeyCount) {
+    // Some entries were sent successfully but not all. Update the persisted keyArray.
     // serialize (convert content of doc into a JSON string and store it in result) - doc is linked to keyArray and therefore always uptodate
     serializeJson(doc, keyArrayStr);  
     preferencesLog.putString("keyArray", keyArrayStr.c_str());  // save changed keys as string in persistent memory 
@@ -606,9 +684,16 @@ void saveFailedLogEntry(LogEntryStruct &logEntry) {
 
   JsonDocument doc;   // JSON Doc for handling keys in string like array
   String keyArrayStr = preferencesLog.getString("keyArray", "[]");  // read stored logentries-keys in string-like array ([key], [default])
-  deserializeJson(doc, keyArrayStr);  // deserialize (parse keyArrayStr to fill doc with its content)
+  DeserializationError error = deserializeJson(doc, keyArrayStr);
+  if (error) {
+    // Corrupted data in persistent memory - start fresh with empty key array.
+    // Existing log entries under their individual keys remain in storage
+    // but won't be retried until a new keyArray references them.
+    doc.clear();
+    deserializeJson(doc, "[]");
+  }
   JsonArray keyArray = doc.as<JsonArray>();  // convert to array
-  
+
   // generate a new unique key for the log entry
   String newKey;
   int keyIndex = keyArray.size(); // start-value for key
@@ -671,7 +756,7 @@ void handleRFIDScanResult(){
       debugService->SerialPrintln_ifDebug(DebugFlags::DONGLE_SCAN, "PostLogToQueue(authorised," , dongleIdStr , ")");
       getCurrentDateTime(logEntry.date, logEntry.time);
 
-      safeCopyStringToChar("authorised", logEntry.access, 11);
+      safeCopyStringToChar("authorised", logEntry.access, CharArraySizes::CharArrayAccessSize);
       safeCopyStringToChar(dongleIdStr, logEntry.dongle_id, CharArraySizes::CharArrayDongleIdSize);
 
       PostLog(logEntry);
@@ -682,7 +767,7 @@ void handleRFIDScanResult(){
       debugService->SerialPrintln_ifDebug(DebugFlags::DONGLE_SCAN, "PostLogToQueue(denied," , dongleIdStr , ")");
       getCurrentDateTime(logEntry.date, logEntry.time);
 
-      safeCopyStringToChar("denied", logEntry.access, 7);
+      safeCopyStringToChar("denied", logEntry.access, CharArraySizes::CharArrayAccessSize);
       safeCopyStringToChar(dongleIdStr, logEntry.dongle_id, CharArraySizes::CharArrayDongleIdSize);
 
       PostLog(logEntry);
@@ -699,44 +784,44 @@ void handleRFIDScanResult(){
 
 bool isDongleIdAuthorized(String dongleIdStr) {
   /*
-  Function checks whether the read DongleId is authorized.
-  The check is performed on the dongles in the volatile memory,
-  this is filled with every restart and from the dongles in the Google Sheet
-  or the persistent memory and updated when changes are made
+  Checks whether the scanned DongleId is authorized.
+  Authorization is checked against the dongle list in RAM, which is synced
+  from Google Sheets at startup, periodically, and on MasterCard scan.
+  Special cases:
+  - MasterCard: triggers a DB refresh without opening the door
+  - OPEN_FOR_ALL_DONGLES: if this value is in the list, all dongles are authorized
   */
   debugService->SerialPrintln_ifDebug(DebugFlags::DONGLE_AUTH, "Start Function isDongleAuthorized");
-  if (xSemaphoreTake(mutexPersistentDongleStorage, pdMS_TO_TICKS(5000)) == pdTRUE) {  // Mutex anfordern
+
+  // MasterCard check first: triggers DB refresh without granting access.
+  // No mutex needed since this doesn't read the dongle list.
+  if (dongleIdStr.equals(DONGLE_MASTER_CARD_UPDATE_DB)) {
+    debugService->SerialPrintln_ifDebug(DebugFlags::DONGLE_AUTH, "MasterCard scanned - refreshing dongle DB");
+    fetchAndStoreDongleIds();
+    return false;
+  }
+
+  if (xSemaphoreTake(mutexDongleList, pdMS_TO_TICKS(5000)) == pdTRUE) {
     for (JsonVariant v : ramDonglesArr) {
         debugService->SerialPrintln_ifDebug(DebugFlags::DONGLE_AUTH, "CompareScan ", dongleIdStr);
         debugService->SerialPrintln_ifDebug(DebugFlags::DONGLE_AUTH, "CompareMem  ", v.as<String>());
 
-
-        // Scan MasterCard -> force Dongle DB Update
-        if (dongleIdStr.equals(DONGLE_MASTER_CARD_UPDATE_DB)) {
-            
-            // Update DB when MasterCard is Scanned, but do not open the Door :-)
-            xSemaphoreGive(mutexPersistentDongleStorage);
-            fetchAndStoreDongleIds();
-            return false;
-        }
-
-        // immer öffnen wenn die Liste "OPEN_FOR_ALL_DONGLES" enthält
+        // Special value: if the list contains OPEN_FOR_ALL_DONGLES, grant access to everyone
         if (v.as<String>() == OPEN_FOR_ALL_DONGLES) {
-                        
-            xSemaphoreGive(mutexPersistentDongleStorage);
+            xSemaphoreGive(mutexDongleList);
             return true;
         }
-        // Vergleich der Dongles in DB mit Rfid-Scan
+        // Match scanned dongle against authorized list
         if (dongleIdStr.equals(v.as<String>())) {
-            xSemaphoreGive(mutexPersistentDongleStorage);
+            xSemaphoreGive(mutexDongleList);
             return true;
         }
     }
-    xSemaphoreGive(mutexPersistentDongleStorage);
+    xSemaphoreGive(mutexDongleList);
     return false;
   }
-  debugService->SerialPrintln_ifDebug(DebugFlags::DONGLE_AUTH, "didn´t get Mutex - return False");
-  return false; // will only be reached if there is no mutex in portMAX_DELAY
+  debugService->SerialPrintln_ifDebug(DebugFlags::DONGLE_AUTH, "Failed to acquire mutex - returning unauthorized");
+  return false;
 } // isDongleIdAuthorized
 
 
