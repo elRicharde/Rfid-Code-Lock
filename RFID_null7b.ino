@@ -46,7 +46,6 @@ void IRAM_ATTR ISRreceiveData0();
 void IRAM_ATTR ISRreceiveData1();
 void trackDoorStateChange();
 void handleRFIDScanResult();
-bool isDongleIdAuthorized(const String& dongleIdStr);
 void checkPendingBuzzerSignals();
 void unlock();
 
@@ -92,14 +91,10 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(INTERRUPT_IO_PIN_1), ISRreceiveData0, FALLING);
   attachInterrupt(digitalPinToInterrupt(INTERRUPT_IO_PIN_2), ISRreceiveData1, FALLING);
 
-  // Create mutex before any task that uses the dongle list
-  mutexDongleList = xSemaphoreCreateMutex();
-  configASSERT(mutexDongleList != nullptr);
-
   // Load dongles from NVS for immediate RFID availability (no HTTP needed)
   loadDonglesFromPersistentMemory();
 
-  // Start network task on Core 0 (handles HTTP, WiFi reconnect, dongle sync)
+  // Start network task on Core 0 (creates mutex + queues internally, then starts task)
   startNetworkTask();
 
   // Buzzer
@@ -246,38 +241,6 @@ void handleRFIDScanResult() {
   interrupts();
 }
 
-bool isDongleIdAuthorized(const String& dongleIdStr) {
-  // MasterCard check: triggers async DB refresh without granting access.
-  // No mutex needed — doesn't read the dongle list.
-  if (dongleIdStr.equals(DONGLE_MASTER_CARD_UPDATE_DB)) {
-    DBG(DebugFlags::DONGLE_AUTH, "MasterCard scanned — requesting dongle refresh");
-    requestDongleRefresh();
-    return false;
-  }
-
-  if (xSemaphoreTake(mutexDongleList, pdMS_TO_TICKS(100)) == pdTRUE) {
-    bool authorized = false;
-    for (JsonVariant v : ramDonglesArr) {
-      DBG(DebugFlags::DONGLE_AUTH, "Compare: ", dongleIdStr, " vs ", v.as<String>());
-
-      // Special value: if the list contains OPEN_FOR_ALL_DONGLES, grant access to everyone
-      if (v.as<String>() == OPEN_FOR_ALL_DONGLES) {
-        authorized = true;
-        break;
-      }
-      if (dongleIdStr.equals(v.as<String>())) {
-        authorized = true;
-        break;
-      }
-    }
-    xSemaphoreGive(mutexDongleList);
-    return authorized;
-  }
-
-  DBG(DebugFlags::DONGLE_AUTH, "Mutex timeout — returning unauthorized");
-  return false;
-}
-
 // =============================================================
 // Buzzer Signal Processing
 // =============================================================
@@ -285,7 +248,7 @@ bool isDongleIdAuthorized(const String& dongleIdStr) {
 void checkPendingBuzzerSignals() {
   // Check if the network task sent a buzzer signal (non-blocking)
   BuzzerSignal signal;
-  if (buzzerSignalQueue != nullptr && xQueueReceive(buzzerSignalQueue, &signal, 0) == pdTRUE) {
+  if (receiveBuzzerSignal(&signal)) {
     switch (signal) {
       case BUZZER_OK:
         buzzerSounds->playSound(BuzzerSoundsRgBase::SoundType::OK);

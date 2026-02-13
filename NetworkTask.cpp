@@ -7,17 +7,13 @@
 #include <atomic>
 
 // =============================================================
-// Shared State Definitions
+// Encapsulated State (file-scoped — no external access possible)
 // =============================================================
-SemaphoreHandle_t mutexDongleList = nullptr;
-JsonDocument ramDonglesDoc;
-JsonArray ramDonglesArr;
-QueueHandle_t logQueue = nullptr;
-QueueHandle_t buzzerSignalQueue = nullptr;
-
-// =============================================================
-// Internal State (file-scoped)
-// =============================================================
+static SemaphoreHandle_t mutexDongleList = nullptr;
+static JsonDocument ramDonglesDoc;
+static JsonArray ramDonglesArr;
+static QueueHandle_t logQueue = nullptr;
+static QueueHandle_t buzzerSignalQueue = nullptr;
 static TaskHandle_t networkTaskHandle = nullptr;
 static std::atomic<int> droppedLogCount{0};  // Atomic: written on Core 1, read on Core 0
 static unsigned long lastDongleRefreshTime = 0;
@@ -32,14 +28,19 @@ static void fetchAndStoreDongleIds();
 static bool sendLogEntryViaHttp(const LogEntryStruct& entry);
 static bool sendStoredLogEntries();
 static void saveFailedLogEntry(const LogEntryStruct& entry);
-static String urlEncode(const String& str);
+static int urlEncodeToBuffer(const char* src, char* dest, int destSize);
 static void sendBuzzerSignal(BuzzerSignal signal);
+static bool arrayContains(const JsonArray& arr, const JsonVariant& value);
 
 // =============================================================
 // Public API
 // =============================================================
 
 void startNetworkTask() {
+  // Create mutex (must exist before task starts using the dongle list)
+  mutexDongleList = xSemaphoreCreateMutex();
+  configASSERT(mutexDongleList != nullptr);
+
   logQueue = xQueueCreate(LOG_QUEUE_SIZE, sizeof(LogEntryStruct));
   buzzerSignalQueue = xQueueCreate(1, sizeof(BuzzerSignal));
   configASSERT(logQueue != nullptr);
@@ -63,8 +64,13 @@ void loadDonglesFromPersistentMemory() {
 
   Preferences prefs;
   prefs.begin("dongleStore", true);  // ReadOnly = true
-  String json = prefs.getString(PERS_MEM_DONGLE_IDS, "[]");
+  char json[2048];
+  json[0] = '\0';
+  size_t len = prefs.getString(PERS_MEM_DONGLE_IDS, json, sizeof(json));
   prefs.end();
+  if (len == 0 || json[0] == '\0') {
+    strcpy(json, "[]");
+  }
 
   DeserializationError error = deserializeJson(ramDonglesDoc, json);
   if (error) {
@@ -94,13 +100,43 @@ void requestDongleRefresh() {
   }
 }
 
-bool arrayContains(const JsonArray& arr, const JsonVariant& value) {
-  for (const auto& v : arr) {
-    if (v == value) {
-      return true;
-    }
+bool isDongleIdAuthorized(const String& dongleIdStr) {
+  // MasterCard check: triggers async DB refresh without granting access.
+  // No mutex needed — doesn't read the dongle list.
+  if (dongleIdStr.equals(DONGLE_MASTER_CARD_UPDATE_DB)) {
+    DBG(DebugFlags::DONGLE_AUTH, "MasterCard scanned — requesting dongle refresh");
+    requestDongleRefresh();
+    return false;
   }
+
+  if (xSemaphoreTake(mutexDongleList, pdMS_TO_TICKS(100)) == pdTRUE) {
+    bool authorized = false;
+    for (JsonVariant v : ramDonglesArr) {
+      DBG(DebugFlags::DONGLE_AUTH, "Compare: ", dongleIdStr, " vs ", v.as<String>());
+
+      // Special value: if the list contains OPEN_FOR_ALL_DONGLES, grant access to everyone
+      if (v.as<String>() == OPEN_FOR_ALL_DONGLES) {
+        authorized = true;
+        break;
+      }
+      if (dongleIdStr.equals(v.as<String>())) {
+        authorized = true;
+        break;
+      }
+    }
+    xSemaphoreGive(mutexDongleList);
+    return authorized;
+  }
+
+  DBG(DebugFlags::DONGLE_AUTH, "Mutex timeout — returning unauthorized");
   return false;
+}
+
+bool receiveBuzzerSignal(BuzzerSignal* outSignal) {
+  if (buzzerSignalQueue == nullptr || outSignal == nullptr) {
+    return false;
+  }
+  return xQueueReceive(buzzerSignalQueue, outSignal, 0) == pdTRUE;
 }
 
 // =============================================================
@@ -189,11 +225,16 @@ static void networkTaskLoop(void* param) {
 static void fetchAndStoreDongleIds() {
   DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Begin fetchAndStoreDongleIds()");
 
-  // --- Step 1: Read persisted dongles from NVS ---
+  // --- Step 1: Read persisted dongles from NVS into stack buffer ---
   Preferences prefs;
   prefs.begin("dongleStore", true);  // ReadOnly = true
-  String persJson = prefs.getString(PERS_MEM_DONGLE_IDS, "[]");
+  char persJson[2048];
+  persJson[0] = '\0';
+  size_t persLen = prefs.getString(PERS_MEM_DONGLE_IDS, persJson, sizeof(persJson));
   prefs.end();
+  if (persLen == 0 || persJson[0] == '\0') {
+    strcpy(persJson, "[]");
+  }
 
   // --- Step 2: Fetch from Google Sheets (outside mutex!) ---
   HTTPClient http;
@@ -209,10 +250,26 @@ static void fetchAndStoreDongleIds() {
     return;
   }
 
-  String payload = http.getString();
+  // --- Step 3: Read response into stack buffer via stream (zero heap allocation) ---
+  char payload[2048];
+  WiFiClient* stream = http.getStreamPtr();
+  if (stream == nullptr) {
+    DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "No stream available");
+    http.end();
+    sendBuzzerSignal(BUZZER_SOS);
+    return;
+  }
+  size_t bytesRead = stream->readBytes(payload, sizeof(payload) - 1);
+  payload[bytesRead] = '\0';
   http.end();
 
-  // --- Step 3: Validate response by parsing (still outside mutex) ---
+  if (bytesRead == 0) {
+    DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Empty response");
+    sendBuzzerSignal(BUZZER_SOS);
+    return;
+  }
+
+  // --- Step 4: Validate response by parsing (still outside mutex) ---
   JsonDocument validationDoc;
   DeserializationError error = deserializeJson(validationDoc, payload);
   if (error) {
@@ -230,15 +287,15 @@ static void fetchAndStoreDongleIds() {
   }
   #endif
 
-  // --- Step 4: Compare online vs. persisted ---
+  // --- Step 5: Compare online vs. persisted ---
   // Simple string comparison of raw JSON payloads. The Google Script returns
   // deterministic JSON, and persJson is the raw payload from the previous fetch.
-  bool isDifferent = (payload != persJson);
+  bool isDifferent = (strcmp(payload, persJson) != 0);
   if (isDifferent) {
     DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Online data differs from persisted");
   }
 
-  // --- Step 5: Update NVS if different (NVS confined to this task — no concurrent access) ---
+  // --- Step 6: Update NVS if different (NVS confined to this task — no concurrent access) ---
   if (isDifferent) {
     Preferences prefsWrite;
     prefsWrite.begin("dongleStore", false);
@@ -247,7 +304,7 @@ static void fetchAndStoreDongleIds() {
     DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "NVS updated with new dongle list");
   }
 
-  // --- Step 6: Pre-parse JSON outside mutex, then swap inside (brief critical section) ---
+  // --- Step 7: Pre-parse JSON outside mutex, then swap inside (brief critical section) ---
   JsonDocument newDoc;
   deserializeJson(newDoc, isDifferent ? payload : persJson);
 
@@ -269,16 +326,18 @@ static void fetchAndStoreDongleIds() {
 }
 
 static bool sendLogEntryViaHttp(const LogEntryStruct& entry) {
-  HTTPClient http;
-  String url;
-  url.reserve(256);  // Pre-allocate to reduce heap fragmentation
-  url = WEB_APP_URL;
-  url += "?action=write_log_pa";
-  url += "&date="; url += urlEncode(String(entry.date));
-  url += "&time="; url += urlEncode(String(entry.time));
-  url += "&access="; url += urlEncode(String(entry.access));
-  url += "&dongle_id="; url += urlEncode(String(entry.dongle_id));
+  // Build URL in stack buffer — zero heap allocation
+  char url[384];
+  int pos = snprintf(url, sizeof(url), "%s?action=write_log_pa&date=", WEB_APP_URL);
+  pos += urlEncodeToBuffer(entry.date, url + pos, sizeof(url) - pos);
+  pos += snprintf(url + pos, sizeof(url) - pos, "&time=");
+  pos += urlEncodeToBuffer(entry.time, url + pos, sizeof(url) - pos);
+  pos += snprintf(url + pos, sizeof(url) - pos, "&access=");
+  pos += urlEncodeToBuffer(entry.access, url + pos, sizeof(url) - pos);
+  pos += snprintf(url + pos, sizeof(url) - pos, "&dongle_id=");
+  pos += urlEncodeToBuffer(entry.dongle_id, url + pos, sizeof(url) - pos);
 
+  HTTPClient http;
   http.begin(url);
   http.setTimeout(20000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
@@ -294,9 +353,15 @@ static bool sendStoredLogEntries() {
   Preferences prefsLog;
   prefsLog.begin(PERS_MEM_FAILED_LOGS, false);
 
+  // Read keyArray from NVS into stack buffer
   JsonDocument doc;
-  String keyArrayStr = prefsLog.getString("keyArray", "[]");
-  DeserializationError error = deserializeJson(doc, keyArrayStr);
+  char keyArrayBuf[1024];
+  keyArrayBuf[0] = '\0';
+  size_t keyBufLen = prefsLog.getString("keyArray", keyArrayBuf, sizeof(keyArrayBuf));
+  if (keyBufLen == 0 || keyArrayBuf[0] == '\0') {
+    strcpy(keyArrayBuf, "[]");
+  }
+  DeserializationError error = deserializeJson(doc, keyArrayBuf);
   if (error) {
     DBG(DebugFlags::SEND_STORED_LOG_ENTRIES, "Failed to deserialize keyArray: ", error.f_str());
     prefsLog.clear();
@@ -313,30 +378,42 @@ static bool sendStoredLogEntries() {
   int originalKeyCount = keyArray.size();
   int i = 0;
   while (i < (int)keyArray.size()) {
-    String key = keyArray[i];
-    String csv = prefsLog.getString(key.c_str(), "");
+    // Read CSV log entry into stack buffer
+    const char* key = keyArray[i].as<const char*>();
+    char csv[128];  // Max: date(10)+time(8)+access(14)+dongle(26)+3commas+null = 62
+    csv[0] = '\0';
+    size_t csvLen = prefsLog.getString(key, csv, sizeof(csv));
 
-    if (csv != "") {
-      int c1 = csv.indexOf(',');
-      int c2 = csv.indexOf(',', c1 + 1);
-      int c3 = csv.indexOf(',', c2 + 1);
+    if (csvLen > 0 && csv[0] != '\0') {
+      int c1 = -1, c2 = -1, c3 = -1;
+      for (int j = 0; csv[j] != '\0'; j++) {
+        if (csv[j] == ',') {
+          if (c1 < 0) c1 = j;
+          else if (c2 < 0) c2 = j;
+          else if (c3 < 0) { c3 = j; break; }
+        }
+      }
 
       // Validate CSV structure — malformed entries are removed
       if (c1 < 0 || c2 < 0 || c3 < 0) {
         DBG(DebugFlags::SEND_STORED_LOG_ENTRIES, "Malformed CSV entry removed: ", key);
-        prefsLog.remove(key.c_str());
+        prefsLog.remove(key);
         keyArray.remove(i);
         continue;
       }
 
+      // Parse CSV fields directly from the stack buffer
       LogEntryStruct entry;
-      safeCopyStringToChar(csv.substring(0, c1), entry.date, CharArrayDateSize);
-      safeCopyStringToChar(csv.substring(c1 + 1, c2), entry.time, CharArrayTimeSize);
-      safeCopyStringToChar(csv.substring(c2 + 1, c3), entry.access, CharArrayAccessSize);
-      safeCopyStringToChar(csv.substring(c3 + 1), entry.dongle_id, CharArrayDongleIdSize);
+      csv[c1] = '\0';  // Terminate date
+      csv[c2] = '\0';  // Terminate time
+      csv[c3] = '\0';  // Terminate access
+      safeCopyStringToChar(csv, entry.date, CharArrayDateSize);
+      safeCopyStringToChar(csv + c1 + 1, entry.time, CharArrayTimeSize);
+      safeCopyStringToChar(csv + c2 + 1, entry.access, CharArrayAccessSize);
+      safeCopyStringToChar(csv + c3 + 1, entry.dongle_id, CharArrayDongleIdSize);
 
       if (sendLogEntryViaHttp(entry)) {
-        prefsLog.remove(key.c_str());
+        prefsLog.remove(key);
         keyArray.remove(i);
         // No i++ needed — array shifted left
       } else {
@@ -344,7 +421,7 @@ static bool sendStoredLogEntries() {
       }
     } else {
       // Empty entry — remove orphaned key to prevent accumulation
-      prefsLog.remove(key.c_str());
+      prefsLog.remove(key);
       keyArray.remove(i);
     }
 
@@ -356,10 +433,10 @@ static bool sendStoredLogEntries() {
     prefsLog.end();
     return true;
   } else if ((int)keyArray.size() != originalKeyCount) {
-    // Partial success — update persisted key array
-    String updatedKeys;
-    serializeJson(doc, updatedKeys);
-    prefsLog.putString("keyArray", updatedKeys.c_str());
+    // Partial success — serialize to stack buffer and update NVS
+    char updatedBuf[1024];
+    serializeJson(doc, updatedBuf, sizeof(updatedBuf));
+    prefsLog.putString("keyArray", updatedBuf);
     prefsLog.end();
     return false;
   } else {
@@ -372,9 +449,15 @@ static void saveFailedLogEntry(const LogEntryStruct& entry) {
   Preferences prefsLog;
   prefsLog.begin(PERS_MEM_FAILED_LOGS, false);
 
+  // Read keyArray from NVS into stack buffer
   JsonDocument doc;
-  String keyArrayStr = prefsLog.getString("keyArray", "[]");
-  DeserializationError error = deserializeJson(doc, keyArrayStr);
+  char keyArrayBuf[1024];
+  keyArrayBuf[0] = '\0';
+  size_t keyBufLen = prefsLog.getString("keyArray", keyArrayBuf, sizeof(keyArrayBuf));
+  if (keyBufLen == 0 || keyArrayBuf[0] == '\0') {
+    strcpy(keyArrayBuf, "[]");
+  }
+  DeserializationError error = deserializeJson(doc, keyArrayBuf);
   if (error) {
     doc.clear();
     deserializeJson(doc, "[]");
@@ -384,44 +467,52 @@ static void saveFailedLogEntry(const LogEntryStruct& entry) {
   // Enforce maximum stored log count to prevent NVS partition exhaustion.
   // Oldest entries are discarded first (FIFO).
   while ((int)keyArray.size() >= MAX_FAILED_LOGS) {
-    String oldestKey = keyArray[0].as<String>();
-    prefsLog.remove(oldestKey.c_str());
-    keyArray.remove(0);
+    const char* oldestKey = keyArray[0].as<const char*>();
     DBG(DebugFlags::SEND_STORED_LOG_ENTRIES, "NVS full — discarded oldest log: ", oldestKey);
+    prefsLog.remove(oldestKey);
+    keyArray.remove(0);
   }
 
   // Generate unique key using monotonic counter (avoids O(n^2) search)
   int nextIndex = prefsLog.getInt("nextIdx", 1);
-  String newKey = "log" + String(nextIndex);
+  char newKey[16];
+  snprintf(newKey, sizeof(newKey), "log%d", nextIndex);
   prefsLog.putInt("nextIdx", nextIndex + 1);
 
-  String csv = String(entry.date) + "," + String(entry.time) + "," + String(entry.access) + "," + String(entry.dongle_id);
-  prefsLog.putString(newKey.c_str(), csv);
+  // Build CSV in stack buffer
+  char csv[128];
+  snprintf(csv, sizeof(csv), "%s,%s,%s,%s", entry.date, entry.time, entry.access, entry.dongle_id);
+  prefsLog.putString(newKey, csv);
 
   keyArray.add(newKey);
 
-  String updatedKeys;
-  serializeJson(doc, updatedKeys);
-  prefsLog.putString("keyArray", updatedKeys.c_str());
+  // Serialize updated keyArray to stack buffer
+  char updatedBuf[1024];
+  serializeJson(doc, updatedBuf, sizeof(updatedBuf));
+  prefsLog.putString("keyArray", updatedBuf);
   prefsLog.end();
 }
 
-static String urlEncode(const String& str) {
-  // URL-encode for safe HTTP query parameters (RFC 3986).
-  // Unreserved characters pass through; all others are percent-encoded.
-  String encoded;
-  encoded.reserve(str.length() + 8);
-  for (unsigned int i = 0; i < str.length(); i++) {
-    char c = str.charAt(i);
+// =============================================================
+// Utility Functions (internal)
+// =============================================================
+
+static int urlEncodeToBuffer(const char* src, char* dest, int destSize) {
+  // URL-encode src directly into dest buffer (RFC 3986, zero heap allocation).
+  // Returns number of bytes written (excluding null terminator).
+  int pos = 0;
+  for (int i = 0; src[i] != '\0' && pos < destSize - 4; i++) {
+    char c = src[i];
     if (isAlphaNumeric(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-      encoded += c;
+      dest[pos++] = c;
     } else {
-      char buf[4];
-      snprintf(buf, sizeof(buf), "%%%02X", (unsigned char)c);
-      encoded += buf;
+      pos += snprintf(dest + pos, destSize - pos, "%%%02X", (unsigned char)c);
     }
   }
-  return encoded;
+  if (pos < destSize) {
+    dest[pos] = '\0';
+  }
+  return pos;
 }
 
 static void sendBuzzerSignal(BuzzerSignal signal) {
@@ -430,4 +521,13 @@ static void sendBuzzerSignal(BuzzerSignal signal) {
   if (buzzerSignalQueue != nullptr) {
     xQueueOverwrite(buzzerSignalQueue, &signal);
   }
+}
+
+static bool arrayContains(const JsonArray& arr, const JsonVariant& value) {
+  for (const auto& v : arr) {
+    if (v == value) {
+      return true;
+    }
+  }
+  return false;
 }
