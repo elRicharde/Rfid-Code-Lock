@@ -1,18 +1,18 @@
 #include "DebugService.h"
 
-// Class Implementation DebugService
-// private
-DebugService* DebugService::_instance = nullptr; // initialize the static variable
+#ifdef DEBUG_MODE
 
-// implementation of constructor
+DebugService* DebugService::_instance = nullptr;
+
 DebugService::DebugService() {
-  _serialPrintMutex = xSemaphoreCreateMutex(); // Initialisiing Mutex here
+  _serialPrintMutex = xSemaphoreCreateMutex();
 }
 
-// public
 DebugService* DebugService::getInstance() {
   if (_instance == nullptr) {
     _instance = new DebugService();
   }
-  return DebugService::_instance;
+  return _instance;
 }
+
+#endif // DEBUG_MODE
