@@ -4,36 +4,21 @@ Items are ordered by priority. Each item should be implemented as a separate com
 
 ---
 
-## 1. [ARCH] Refactor HTTP calls to separate FreeRTOS task
+## 1. ~~[ARCH] Refactor HTTP calls to separate FreeRTOS task~~ DONE
 
-**Priority:** High
-**Relates to:** CODE_REVIEW 3.1, Performance
+**Status:** Completed
+**Implemented in:** `NetworkTask.h` / `NetworkTask.cpp`
 
-Currently all HTTP calls (PostLog, fetchAndStoreDongleIds) block the main loop for up to 20 seconds (HTTP timeout). During this time, RFID scanning and door monitoring are paused.
-
-**Goal:** Move HTTP operations to a dedicated FreeRTOS task on Core 0. Use a queue to pass log entries from the main loop to the HTTP task. This enables non-blocking logging and dongle refresh.
-
-**Acceptance Criteria:**
-- Log entries are queued and sent asynchronously
-- RFID scanning is never blocked by network operations
-- Dongle refresh runs in background without affecting scan responsiveness
-- Error handling for queue full scenarios
+All HTTP operations (log sending, dongle refresh) moved to dedicated FreeRTOS task on Core 0. Log entries are queued via `enqueueLogEntry()` (non-blocking). Dongle refresh triggered via `xTaskNotify` (MasterCard) or periodic timer. Buzzer signals from network task to main loop via FreeRTOS queue. RFID scanning on Core 1 is never blocked by network operations. Failed logs stored in NVS with retry backoff (60s) and cap (50 entries).
 
 ---
 
-## 2. [ARCH] Debug architecture redesign
+## 2. ~~[ARCH] Debug architecture redesign~~ DONE
 
-**Priority:** Medium
-**Relates to:** CODE_REVIEW 1.1 (extended), 3.1
+**Status:** Completed
+**Implemented in:** `Config.h`, `DebugService.h` / `DebugService.cpp`
 
-Consider replacing the current runtime debug flags with a preprocessor-based approach (`#ifdef DEBUG_MODE`) to completely eliminate debug code from production binaries (zero flash/RAM overhead). The current `constexpr bool` approach already enables compiler dead-code elimination, but the DebugService instance and Serial initialization remain.
-
-**Options to evaluate:**
-- `#ifdef DEBUG_MODE` preprocessor guards (zero overhead, less flexible)
-- Current constexpr approach with always-initialized service (current fix, ~80 bytes RAM)
-- Interface-based with empty production class (adds vtable overhead, prevents inlining)
-
-**Decision:** Evaluate after FreeRTOS refactor (item 1), as the debug architecture may need to account for multi-task logging.
+Replaced runtime `constexpr bool` flags with `#ifdef DEBUG_MODE` preprocessor approach. `DBG()` macro compiles to `((void)0)` in production — zero binary overhead. Per-subsystem flags (`DebugFlags::WIFI_LOGGING`, `DONGLE_SCAN`, etc.) available inside debug builds. Meyers singleton for thread-safe initialization. Serial, DebugService instance, and all debug code completely eliminated from production binary.
 
 ---
 
@@ -70,21 +55,18 @@ The Google Apps Script web app currently accepts unauthenticated requests. Anyon
 
 ---
 
-## 5. [ARCH] Class architecture review
+## 5. ~~[ARCH] Class architecture review~~ DONE
 
-**Priority:** Low
-**Relates to:** User request
+**Status:** Completed
+**Implemented in:** Full project restructuring
 
-The architecture has grown organically. Review overall class design, dependencies, and separation of concerns.
-
-**Areas to evaluate:**
-- WiFi management (connect, reconnect, status) as separate module
-- RFID/Wiegand handling as separate module
-- Logging service (local + remote) as separate module
-- Configuration management (Secrets, constants)
-- DebugService role and scope
-
-**Depends on:** Items 1 and 2 — the FreeRTOS refactor and debug redesign will significantly change the architecture. Do this review after those are complete.
+Modular architecture with clear separation of concerns:
+- `Config.h` — Central configuration, types, constants, shared utilities
+- `DebugService.h/.cpp` — Debug-only singleton with per-subsystem flags
+- `NetworkTask.h/.cpp` — All network operations, NVS access, dongle sync, log management
+- `RFID_null7b.ino` — Slim main sketch: setup, loop, ISR, door monitoring, RFID processing, unlock
+- `Secrets.h` — Credentials and URLs (unchanged)
+- Thread safety: mutex for dongle list, queues for cross-task communication, xTaskNotify for signaling
 
 ---
 

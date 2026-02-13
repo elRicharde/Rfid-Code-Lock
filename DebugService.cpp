@@ -4,6 +4,7 @@
 
 DebugService::DebugService() {
   _serialPrintMutex = xSemaphoreCreateMutex();
+  configASSERT(_serialPrintMutex != nullptr);
 }
 
 // Meyers singleton: C++11 guarantees thread-safe initialization of static locals.

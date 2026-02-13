@@ -343,8 +343,9 @@ static bool sendStoredLogEntries() {
         break;  // No connectivity — stop trying
       }
     } else {
-      // Empty entry — skip to prevent infinite loop
-      i++;
+      // Empty entry — remove orphaned key to prevent accumulation
+      prefsLog.remove(key.c_str());
+      keyArray.remove(i);
     }
 
     vTaskDelay(1);  // Yield between HTTP calls

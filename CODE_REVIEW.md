@@ -1,419 +1,180 @@
 # Code Review: RFID-Zugangskontrolle (null7b Technikecke PA)
 
-**Datum:** 2026-02-12
-**Projekt:** ESP32-S3 RFID Access Control mit Google Sheets Integration
-**Dateien:** 6 Quelldateien, ~900 Zeilen Code
-**Reviewer:** Claude Opus 4.6
+**Date:** 2026-02-12
+**Project:** ESP32-S3 RFID Access Control with Google Sheets Integration
+**Review scope:** Full codebase after FreeRTOS refactoring (Backlog items 1, 2, 5)
+**Files:** 8 source files, ~700 lines firmware code
 
 ---
 
-## Inhaltsverzeichnis
+## Architecture Overview
 
-- [1. Kritische Bugs](#1-kritische-bugs)
-- [2. Mittlere Bugs / Probleme](#2-mittlere-bugs--probleme)
-- [3. Architektur & Design](#3-architektur--design)
-- [4. Sicherheit](#4-sicherheit)
-- [5. Code-Qualitat](#5-code-qualität)
-- [6. Zusammenfassung](#6-zusammenfassung)
-
----
-
-## 1. Kritische Bugs
-
-### 1.1 Crash bei `DEBUG_MODE = false`
-
-**Datei:** `RFID_null7b.ino:175`
-**Schwere:** Kritisch
-
-`debugService` wird nur initialisiert wenn `DEBUG_MODE == true` (Zeile 154-168), aber ausserhalb des if-Blocks bedingungslos verwendet:
-
-```cpp
-// Zeile 175 - wird IMMER erreicht, auch wenn debugService == nullptr
-debugService->SerialPrintln_ifDebug(DebugFlags::WIFI_LOGGING, "Connect to WiFi...");
+```
+Core 1 (Main Loop)              Core 0 (Network Task)
+===================              =====================
+ISR: Wiegand bits (IRAM)         WiFi reconnect (30s)
+loop(): door monitoring          Periodic dongle refresh (4h)
+        RFID scan processing     On-demand refresh (MasterCard)
+        buzzer signal check      Log queue processing
+        Wiegand timeout          Failed log retry (60s backoff)
+        10ms yield               NVS persistence
+                                 100ms yield
+         ──── Communication ────
+         logQueue (30 entries)     Main → Network
+         buzzerSignalQueue (1)     Network → Main
+         mutexDongleList           Shared dongle array
+         xTaskNotify               MasterCard → refresh
 ```
 
-Da `WIFI_LOGGING` auch `false` ist, wird `if (Debug)` in der Methode zwar `false` ergeben, aber der Methodenaufruf auf einem nullptr ist **Undefined Behavior** in C++. Das funktioniert zufaellig auf manchen Compilern, ist aber nicht garantiert und crasht moeglicherweise bei Compiler-Updates oder Optimierungs-Level-Aenderungen.
+### File Structure
 
-**Betroffen:** Alle `debugService->` Aufrufe ausserhalb des `if (DebugFlags::DEBUG_MODE)` Blocks in `setup()` sowie alle Aufrufe in den weiteren Funktionen.
-
-**Fix:** `debugService` immer initialisieren (auch bei `DEBUG_MODE = false`), oder alle Aufrufe mit einem Null-Check bzw. `if (DebugFlags::DEBUG_MODE)` schuetzen.
-
----
-
-### 1.2 Infinite Loop in `sendStoredLogEntries()`
-
-**Datei:** `RFID_null7b.ino:549-578`
-**Schwere:** Kritisch
-
-```cpp
-while (i < keyArray.size()) {
-    String key = keyArray[i];
-    String logEntryStringCommaSeparated = preferencesLog.getString(key.c_str(), "");
-
-    if (logEntryStringCommaSeparated != "") {
-        // ... send or break
-    }
-    // KEIN i++ und KEIN break wenn der String leer ist!
-}
-```
-
-Wenn ein gespeicherter Log-Eintrag leer ist (`""`), wird `i` nie inkrementiert und die Schleife nie verlassen. Das System haengt in einer **Endlosschleife**, der ESP reagiert nicht mehr.
-
-**Fix:** Nach dem `if`-Block ein `else { i++; }` einfuegen, oder den leeren Eintrag entfernen und den Index nicht erhoehen.
+| File | Purpose | Lines |
+|------|---------|-------|
+| `Config.h` | Central configuration, types, constants, shared utilities | ~125 |
+| `DebugService.h` | Debug singleton, DBG macro, DebugFlags (ifdef guarded) | ~70 |
+| `DebugService.cpp` | Meyers singleton implementation (ifdef guarded) | ~18 |
+| `NetworkTask.h` | Network task public API, extern declarations | ~45 |
+| `NetworkTask.cpp` | HTTP operations, dongle sync, log management, FreeRTOS task | ~310 |
+| `RFID_null7b.ino` | Main sketch: setup, loop, ISR, door, RFID, buzzer, unlock | ~210 |
+| `Secrets.h` | WiFi credentials, Google Script URLs | ~20 |
+| `googleScript` | Google Apps Script web app (read dongles, write logs) | ~80 |
+| `Convert_DEC_to_BIN` | Google Sheets custom function (decimal to Wiegand 26-bit) | ~35 |
 
 ---
 
-### 1.3 Shallow Copy von JsonArray
+## 1. Thread Safety & Concurrency
 
-**Datei:** `RFID_null7b.ino:546`
-**Schwere:** Kritisch
+### 1.1 Mutex Usage — GOOD
 
-```cpp
-JsonArray keyArrayCopy = keyArray;  // Das ist KEINE tiefe Kopie!
-```
+The `mutexDongleList` protects `ramDonglesDoc` / `ramDonglesArr` with a 100ms timeout. The critical section is minimal: only the `std::move` swap and array reassignment occur inside the mutex. JSON parsing and HTTP calls are correctly performed outside the mutex. The `isDongleIdAuthorized()` function uses a single `authorized` flag to avoid early-return mutex leaks.
 
-`JsonArray` ist eine Referenz/View auf dasselbe `JsonDocument`. Wenn Elemente aus `keyArray` mit `keyArray.remove(i)` entfernt werden, aendert sich `keyArrayCopy` identisch mit. Die Vergleichslogik in Zeile 585:
+### 1.2 Queue-Based Communication — GOOD
 
-```cpp
-} else if (keyArray.size() != keyArrayCopy.size()) {  // IMMER gleich!
-```
+`logQueue` (depth 30) passes `LogEntryStruct` by value from Core 1 to Core 0. `buzzerSignalQueue` (depth 1) uses `xQueueOverwrite` for latest-wins semantics. Both are created with `configASSERT` guards.
 
-...ist **immer `false`**.
+### 1.3 ISR Safety — GOOD
 
-**Konsequenz:** Wenn nur ein Teil der gespeicherten Logs erfolgreich gesendet wird, wird der `keyArray` im persistenten Speicher nie aktualisiert. Diese Logs werden bei jedem Neustart erneut gesendet (Duplikate) oder blockieren neue Eintraege.
+ISR handlers use `IRAM_ATTR`, only access `volatile` variables, and call only `millis()` (ISR-safe on ESP32). The `noInterrupts()` sections correctly snapshot all ISR variables atomically before processing.
 
-**Fix:** Die Groesse vor der Schleife in einer `int`-Variable speichern: `int originalSize = keyArray.size();`
+### 1.4 Cross-Core Atomic Access — GOOD
 
----
+`droppedLogCount` uses `std::atomic<int>` for safe cross-core read/write. `xTaskNotify` provides memory barriers for the dongle refresh signal.
 
-### 1.4 Pointer-Arithmetik statt String-Konkatenation
+### 1.5 Remaining Concern — LOW RISK
 
-**Datei:** `RFID_null7b.ino:357`
-**Schwere:** Kritisch
-
-```cpp
-debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "http is " + httpCode);
-```
-
-`"http is "` ist ein `const char*`. Der `+`-Operator mit `int` fuehrt **Pointer-Arithmetik** aus (nicht String-Verkettung!). Das liest aus zufaelligem Speicher und fuehrt zu Absturz oder Garbage-Output.
-
-**Fix:** Die variadic Template-Methode nutzen (Komma statt Plus):
-```cpp
-debugService->SerialPrintln_ifDebug(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "http is ", httpCode);
-```
+`ramDonglesArr` must never be accessed without holding `mutexDongleList`. This invariant is correctly maintained in all current code paths but relies on developer discipline. A future refactor could accidentally break this. Consider documenting this constraint prominently in `NetworkTask.h`.
 
 ---
 
-### 1.5 Doppeltes `digitalRead` bei Tuerstatus
+## 2. Resource Management
 
-**Datei:** `RFID_null7b.ino:456-457`
-**Schwere:** Hoch
+### 2.1 Stack & Heap — GOOD
 
-```cpp
-if (DoorStateMemory != digitalRead(DOOR_STATE_PIN)){      // Erster Read
-    DoorStateMemory = digitalRead(DOOR_STATE_PIN);          // Zweiter Read - Pin kann sich geaendert haben!
-```
+Network task stack is 16 KB (generous for HTTPS/TLS). Debug builds include stack high-water mark and heap monitoring (logged every 60s). `String::reserve()` is used for URL construction to reduce heap fragmentation.
 
-Zwischen den zwei Reads kann sich der Pin-Zustand aendern (Prellen, Timing). Das kann zu inkonsistentem Zustand fuehren, z.B. wird ein Zustandswechsel erkannt, aber der gespeicherte Wert stimmt nicht mit dem urspruenglichen ueberein.
+### 2.2 NVS Wear — GOOD
 
-**Fix:** Einmal lesen, Wert zwischenspeichern:
-```cpp
-int currentState = digitalRead(DOOR_STATE_PIN);
-if (DoorStateMemory != currentState) {
-    DoorStateMemory = currentState;
-```
+`Preferences::clear()` was removed from the dongle update path (direct `putString` overwrite). Failed log entries are capped at `MAX_FAILED_LOGS = 50` with FIFO discard. The `nextIdx` monotonic counter adds one small NVS write per failed log save.
+
+### 2.3 Remaining Concern — LOW RISK
+
+Heavy `String` usage in HTTP paths (URL construction, `http.getString()`, JSON serialization) causes heap allocations on every network operation. On ESP32-S3 with 512 KB SRAM this is unlikely to cause issues, but for multi-year uptime, heap fragmentation monitoring (already in debug builds) should be watched.
 
 ---
 
-### 1.6 Fehlender RFID-Timeout
+## 3. Debug Architecture
 
-**Datei:** `RFID_null7b.ino:296, 658`
-**Schwere:** Hoch
+### 3.1 Zero-Overhead Production — GOOD
 
-Wenn nur ein Teil der 26 Wiegand-Bits empfangen wird (z.B. durch Stoerung oder partielles Lesen), bleibt `bitCount` groesser als 0 aber kleiner als 26 - fuer immer. Es gibt keinen Reset-Mechanismus. Das System kann dann **nie wieder einen Dongle lesen** bis zum Neustart.
+`#ifdef DEBUG_MODE` with `DBG()` macro compiles to `((void)0)` when disabled. The preprocessor discards all arguments including `DebugFlags::` references, so the `DebugFlags` struct and `DebugService` class don't even need to exist in production. Serial is never initialized. True zero overhead.
 
-**Fix:** Einen Timestamp beim ersten empfangenen Bit setzen und in `loop()` pruefen ob seit dem letzten Bit zu viel Zeit vergangen ist (typisch ~50ms). Dann `bitCount` und `dongleValue` zuruecksetzen:
+### 3.2 Per-Subsystem Flags — GOOD
 
-```cpp
-volatile unsigned long lastBitTime = 0;  // global
+`DebugFlags` struct provides granular control: `SETUP`, `WIFI_LOGGING`, `FETCH_AND_STORE_DONGLE_IDS`, `FETCH_AND_STORE_DONGLE_IDS_DETAIL`, `DOOR_STATE`, `DONGLE_SCAN`, `DONGLE_AUTH`, `SEND_STORED_LOG_ENTRIES`, `NETWORK_TASK`. All default to `true` in debug builds; developers can disable individual subsystems to reduce output.
 
-// In ISRs:
-lastBitTime = millis();
+### 3.3 Thread-Safe Singleton — GOOD
 
-// In loop():
-if (bitCount > 0 && bitCount < 26 && millis() - lastBitTime > 50) {
-    noInterrupts();
-    bitCount = 0;
-    dongleValue = 0;
-    interrupts();
-}
-```
+Meyers singleton (`static DebugService instance` in `getInstance()`) guarantees C++11 thread-safe initialization even if first called concurrently from both cores. Serial print mutex (100ms timeout) prevents interleaved output.
 
 ---
 
-### 1.7 Fehlende `IRAM_ATTR` bei ISR-Funktionen
+## 4. Network Operations
 
-**Datei:** `RFID_null7b.ino:288, 304`
-**Schwere:** Hoch
+### 4.1 HTTP Timeout & Redirect — GOOD
 
-```cpp
-void ISRreceiveData0() {   // Fehlt: IRAM_ATTR
-void ISRreceiveData1() {   // Fehlt: IRAM_ATTR
-```
+Both `fetchAndStoreDongleIds()` and `sendLogEntryViaHttp()` set `setTimeout(20000)` and `setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS)` consistently. Google Apps Script requires redirect following.
 
-Auf ESP32 muessen Interrupt Service Routines im IRAM (Internal RAM) liegen. Ohne `IRAM_ATTR` koennen die Funktionen im Flash liegen. Wenn waehrend einer Flash-Operation (z.B. Preferences-Schreibzugriff) ein Interrupt auftritt, fuehrt das zu einem **Guru Meditation Error (Crash)**.
+### 4.2 WiFi Reconnect — GOOD
 
-**Fix:**
-```cpp
-void IRAM_ATTR ISRreceiveData0() { ... }
-void IRAM_ATTR ISRreceiveData1() { ... }
-```
+Moved from main loop to network task. Uses `WiFi.disconnect()` + `WiFi.begin()` (clean reconnection) instead of `WiFi.reconnect()` (fragile). 30-second check interval.
 
----
+### 4.3 Failed Log Management — GOOD
 
-## 2. Mittlere Bugs / Probleme
+Failed logs are stored in NVS as comma-separated strings with a JSON key array. Retry with 60-second backoff prevents rapid NVS wear. CSV validation catches malformed entries. Empty/orphaned entries are cleaned up. FIFO cap at 50 entries.
 
-### 2.1 Wiegand-Paritaetsbits werden nicht validiert
+### 4.4 Dongle Sync — GOOD
 
-**Datei:** `RFID_null7b.ino:658-696`
+Three sync paths: (1) NVS load at boot (immediate availability), (2) HTTP fetch at startup and every 4 hours, (3) on-demand via MasterCard with 30-second debounce. Simple string comparison of raw JSON payloads for change detection (deterministic Google Script output).
 
-`handleRFIDScanResult()` nutzt alle 26 Bits als ID, ohne Bit 0 (even parity) und Bit 25 (odd parity) zu pruefen. Im Wiegand-26-Format sind Bit 1 und Bit 26 Paritaetsbits, die nur 24 Datenbits schuetzen.
+### 4.5 URL Encoding — GOOD
 
-**Konsequenz:** Fehlerhaft empfangene IDs koennten als gueltig durchgehen oder gueltige Dongles koennen abgelehnt werden.
+RFC 3986 compliant `urlEncode()` for all HTTP query parameters. Prevents injection of control characters in log data.
 
-**Empfehlung:** Paritaet pruefen und bei Fehler den Scan verwerfen.
+### 4.6 Remaining Concern — LOW RISK
+
+Google Apps Script authentication is absent (Backlog item 4). Anyone with the URL can read dongle IDs or write arbitrary log entries.
 
 ---
 
-### 2.2 Hardcoded Buffer-Groessen
+## 5. RFID / Wiegand Processing
 
-**Datei:** `RFID_null7b.ino:463-464, 472-474`
+### 5.1 Bit Collection — GOOD
 
-```cpp
-safeCopyStringToChar("door_is_closed", logEntry.access, 15);  // Magic number statt CharArrayAccessSize
-safeCopyStringToChar("doorstate", logEntry.dongle_id, 10);     // 10 statt CharArrayDongleIdSize
-```
+ISR-based bit collection with 26-bit limit. `lastBitTime` tracked for timeout detection. Both ISR handlers are minimal and IRAM-resident.
 
-Bei Aenderung der Enum-Werte oder Strings bricht das still und unbemerkt.
+### 5.2 Timeout Reset — GOOD
 
-**Fix:** Ueberall `CharArraySizes::CharArrayAccessSize` bzw. `CharArraySizes::CharArrayDongleIdSize` verwenden.
+Partial reads (1-25 bits) are reset after 200ms. All ISR variables (`bitCount`, `lastBitTime`) are snapshotted atomically with `noInterrupts()`. Design rationale is documented in comments.
 
----
+### 5.3 Scan Processing Race — DOCUMENTED, ACCEPTABLE
 
-### 2.3 `MasterCard`-Check innerhalb der Schleife
+Between snapshot and ISR state reset, a new scan could theoretically begin and be discarded. This is documented as acceptable (human badge scans are seconds apart).
 
-**Datei:** `RFID_null7b.ino:715`
+### 5.4 Remaining Concern — BACKLOG
 
-```cpp
-for (JsonVariant v : ramDonglesArr) {
-    if (dongleIdStr.equals(DONGLE_MASTER_CARD_UPDATE_DB)) {  // bei JEDER Iteration geprueft
-```
-
-Die MasterCard-Pruefung hat nichts mit dem aktuellen Array-Element `v` zu tun. Sie sollte **vor** der Schleife stehen, um unnoetige Iterationen zu vermeiden.
+Wiegand parity bits (bit 1 = even, bit 26 = odd) are not validated. Corrupted reads could produce false positives or negatives. See Backlog item 3.
 
 ---
 
-### 2.4 Deserialisierung ohne Fehlerpruefung in `saveFailedLogEntry`
+## 6. Google Apps Script
 
-**Datei:** `RFID_null7b.ino:609`
+### 6.1 Read Action — GOOD
 
-```cpp
-deserializeJson(doc, keyArrayStr);  // Rueckgabewert wird ignoriert
-```
+Returns flat JSON array of dongle IDs from column C. Correctly filters empty rows.
 
-Wenn der persistente Speicher korrupte Daten enthaelt, wird das nicht erkannt. Neue Log-Eintraege koennten verloren gehen.
+### 6.2 Write Action — GOOD
 
----
+Looks up dongle name from column A by matching dongle ID in column C. Appends log row with timestamp, date, time, access type, dongle ID, and name. Range `A2:C` is correct.
 
-### 2.5 Main Loop ohne Delay
+### 6.3 Error Handling — GOOD
 
-**Datei:** `RFID_null7b.ino:216-221`
+Try-catch wraps all operations. Invalid/missing action parameter returns structured JSON error. All variables properly scoped with `const`/`var`.
 
-```cpp
-void loop() {
-    trackDoorStateChange();
-    handleRFIDScanResult();
-    // Kein delay/yield -> maximale CPU-Last, unnoetig hoher Stromverbrauch
-}
-```
+### 6.4 Remaining Concern — BACKLOG
 
-**Fix:** Ein kurzes `delay(1)` oder `vTaskDelay(1)` einfuegen.
+No authentication (Backlog item 4). `Convert_DEC_to_BIN` has swapped parity variable names (Backlog item 3). German comments (Backlog item 6).
 
 ---
 
-## 3. Architektur & Design
-
-### 3.1 Blocking HTTP-Calls im Main Loop
-
-`PostLog()` -> `sendStoredLogEntries()` -> `sendLogEntryViaHttp()` blockiert den Main-Thread fuer bis zu 20+ Sekunden (HTTP-Timeout). Waehrend dieser Zeit:
-
-- Werden **keine RFID-Scans** verarbeitet
-- Wird **kein Tuerstatus** ueberwacht
-- Ist das System effektiv nicht funktionsfaehig
-
-**Empfehlung:** HTTP-Calls in einen separaten FreeRTOS-Task auslagern und Log-Eintraege per Queue uebergeben. Der ESP32 hat zwei Kerne - ideal fuer diese Aufgabe.
-
----
-
-### 3.2 Kein WiFi-Reconnect-Handling
-
-Nach Verbindungsverlust gibt es keine explizite Reconnect-Logik. `WiFi.begin()` wird nur einmal in `setup()` aufgerufen. Der ESP32 hat Auto-Reconnect, aber das ist nicht immer zuverlaessig.
-
-**Empfehlung:** Periodisch `WiFi.status()` pruefen und bei Bedarf `WiFi.reconnect()` aufrufen.
-
----
-
-### 3.3 Dongle-IDs werden nur beim Start geladen
-
-`fetchAndStoreDongleIds()` wird nur in `setup()` und bei MasterCard-Scan aufgerufen. Neue Dongles erfordern entweder einen Neustart oder die MasterCard.
-
-**Empfehlung:** Periodisches Refresh (z.B. alle 30 Minuten) in einem separaten Task.
-
----
-
-### 3.4 `ramDonglesArr` Initialisierung fehlerhaft
-
-**Datei:** `RFID_null7b.ino:71`
-
-```cpp
-JsonArray ramDonglesArr = ramDonglesDoc.as<JsonArray>(); // Null-Array auf leerem Doc!
-```
-
-Wird dann in `setup()` Zeile 202 nochmal korrekt initialisiert. Die globale Initialisierung ist nutzlos und irrefuehrend.
-
----
-
-## 4. Sicherheit
-
-### 4.1 Keine URL-Kodierung bei HTTP-Parametern
-
-**Datei:** `RFID_null7b.ino:508`
-
-```cpp
-webappurl_write += "&date=" + String(logEntry.date) + "&time=" + ...
-```
-
-Wenn ein Feld Sonderzeichen enthaelt (`&`, `=`, Leerzeichen), wird die URL fehlerhaft. Das Risiko ist gering da die Daten intern generiert werden, aber es ist schlechte Praxis und koennte bei unerwarteten Eingaben zu Problemen fuehren.
-
----
-
-### 4.2 Google Script ohne Authentifizierung
-
-**Datei:** `googleScript:2`
-
-Die Web-App akzeptiert jede Anfrage ohne Authentifizierung. Jeder mit der URL kann:
-- Alle autorisierten Dongle-IDs auslesen (`action=read_pa`)
-- Beliebige Log-Eintraege schreiben (`action=write_log_pa`)
-
-**Empfehlung:** Mindestens einen API-Key als Parameter hinzufuegen und im Script validieren.
-
----
-
-### 4.3 Google Script: `access` als implizite globale Variable
-
-**Datei:** `googleScript:45`
-
-```javascript
-access = String(e.parameter.access);  // 'var'/'let'/'const' fehlt!
-```
-
-`access` wird ohne Deklaration zugewiesen und wird damit zur impliziten globalen Variable. Bei parallelen Anfragen an die Web-App koennte das zu Race Conditions fuehren.
-
-**Fix:** `var access = ...` oder besser `const access = ...`
-
----
-
-### 4.4 Google Script: Ungewoehnliche Range-Definition
-
-**Datei:** `googleScript:50`
-
-```javascript
-var idRange = idSheet.getRange('C2:A' + idSheet.getLastRow());
-```
-
-Die Range geht von Spalte C zu Spalte A (rueckwaerts). Google Sheets normalisiert das intern zu `A2:C`, aber es ist verwirrend und fehleranfaellig. Korrekt waere `'A2:C' + idSheet.getLastRow()`.
-
----
-
-## 5. Code-Qualitaet
-
-### 5.1 Tippfehler im Konstantennamen
-
-**Datei:** `RFID_null7b.ino:35`
-
-```cpp
-constexpr const char PERS_MEM_DONGLE_IDS[10] = "DonlgeIds";  // "Donlge" statt "Dongle"
-```
-
-Funktioniert intern konsistent, ist aber verwirrend beim Lesen und Debugging.
-
----
-
-### 5.2 Vertauschte Variablennamen in `DEC_TO_BIN26`
-
-**Datei:** `Convert_DEC_to_BIN:26-27`
-
-```javascript
-var evenParityBit = ...  // Berechnet tatsaechlich ODD Parity (Bit 26)
-var oddParityBit = ...   // Berechnet tatsaechlich EVEN Parity (Bit 1)
-```
-
-Die berechneten **Werte sind korrekt** fuer Wiegand-26, aber die Variablennamen sind vertauscht. Das fuehrt zu Verwirrung bei Wartung und Debugging.
-
----
-
-### 5.3 Mutex-Benennung ist irrefuehrend
-
-`mutexPersistentDongleStorage` schuetzt `ramDonglesArr` (RAM), nicht den persistenten Speicher. Der Name suggeriert etwas anderes als der tatsaechliche Schutzbereich.
-
----
-
-### 5.4 Gemischte Sprachen
-
-Kommentare und Debug-Meldungen sind ein Mix aus Deutsch und Englisch. Fuer ein Open-Source-Projekt empfiehlt sich einheitlich Englisch.
-
----
-
-### 5.5 `constexpr const char` Arrays mit expliziten Groessen
-
-**Datei:** `Secrets.h`
-
-```cpp
-constexpr char SSID[10] = "YOUR SSID";
-constexpr char WEB_APP_URL[124] = "https://...";
-```
-
-Hardcoded Array-Groessen sind fehleranfaellig. Wenn der tatsaechliche String laenger ist als die angegebene Groesse, wird er still abgeschnitten. Besser den Compiler die Groesse bestimmen lassen:
-
-```cpp
-constexpr char SSID[] = "YOUR SSID";
-```
-
----
-
-## 6. Zusammenfassung
-
-| Kategorie | Anzahl | Schwere |
-|-----------|--------|---------|
-| Kritische Bugs | 7 | System-Crash, Endlosschleifen, Datenverlust |
-| Mittlere Bugs | 5 | Fehlerhafte Logik, unnoetige CPU-Last |
-| Architektur-Probleme | 4 | Blockierendes I/O, fehlende Reconnect-Logik |
-| Sicherheitsprobleme | 4 | Fehlende Authentifizierung, implizite Globals |
-| Code-Qualitaet | 5 | Tippfehler, irrefuehrende Namen, Inkonsistenzen |
-| **Gesamt** | **25** | |
-
-### Priorisierte Empfehlung
-
-| Prioritaet | Issue | Grund |
-|------------|-------|-------|
-| 1 | Crash bei `DEBUG_MODE = false` (#1.1) | Betrifft den Produktivbetrieb direkt |
-| 2 | Infinite Loop in `sendStoredLogEntries` (#1.2) | Kann das System komplett lahmlegen |
-| 3 | `IRAM_ATTR` bei ISRs (#1.7) | Sporadische Crashes bei Flash-Operationen |
-| 4 | RFID-Timeout (#1.6) | System kann dauerhaft blockiert werden |
-| 5 | Shallow Copy JsonArray (#1.3) | Doppelte Log-Eintraege, Speicher-Inkonsistenz |
-| 6 | Blocking HTTP im Main Loop (#3.1) | System fuer 20+ Sekunden nicht funktionsfaehig |
-| 7 | Pointer-Arithmetik (#1.4) | Speicherzugriffsfehler bei Debug-Ausgabe |
-
----
-
-*Code Review erstellt mit Claude Opus 4.6*
+## Summary
+
+| Category | Status |
+|----------|--------|
+| Thread Safety | All shared state properly synchronized |
+| Resource Management | Stack, heap, NVS all within safe bounds with monitoring |
+| Debug Architecture | Zero production overhead, per-subsystem flags, thread-safe |
+| Network Operations | Non-blocking, resilient, properly configured |
+| RFID Processing | ISR-safe, timeout-protected, race documented |
+| Code Structure | Clean modular architecture with clear responsibilities |
+
+**Open items:** See `BACKLOG.md` items 3, 4, 6.
