@@ -59,8 +59,9 @@ constexpr int DOOR_IS_OPEN = 1;
 // Network Task Configuration
 // =============================================================
 constexpr int LOG_QUEUE_SIZE = 30;              // Max queued log entries (30 x 62 bytes = ~1.9 KB)
-constexpr int NETWORK_TASK_STACK_SIZE = 12288;  // 12 KB — HTTPS with TLS + JSON parsing needs generous stack
-constexpr int NETWORK_TASK_PRIORITY = 1;        // Lower than default loop task (priority 1)
+constexpr int NETWORK_TASK_STACK_SIZE = 16384;  // 16 KB — HTTPS with TLS + JSON parsing needs generous stack
+constexpr int NETWORK_TASK_PRIORITY = 1;        // Same as default loop task (both pinned to separate cores)
+constexpr int MAX_FAILED_LOGS = 50;             // Max stored failed log entries in NVS (prevents partition exhaustion)
 constexpr int NETWORK_TASK_CORE = 0;            // Core 0 (Core 1 = main loop + ISRs)
 constexpr int NETWORK_TASK_LOOP_DELAY_MS = 100; // Task loop interval
 
@@ -112,6 +113,8 @@ inline bool safeCopyStringToChar(const String& source, char* dest, size_t destSi
 inline void getCurrentDateTime(char formattedDate[CharArrayDateSize], char formattedTime[CharArrayTimeSize]) {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
+    static_assert(sizeof("Date Error") <= CharArrayDateSize, "Error string too long for date buffer");
+    static_assert(sizeof("Date Err") <= CharArrayTimeSize, "Error string too long for time buffer");
     safeCopyStringToChar("Date Error", formattedDate, CharArrayDateSize);
     safeCopyStringToChar("Date Err", formattedTime, CharArrayTimeSize);
     return;

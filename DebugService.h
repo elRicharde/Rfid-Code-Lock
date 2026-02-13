@@ -10,6 +10,7 @@
 // Toggle individual flags to narrow debug output.
 // =============================================================
 struct DebugFlags {
+  static constexpr bool SETUP = true;
   static constexpr bool WIFI_LOGGING = true;
   static constexpr bool FETCH_AND_STORE_DONGLE_IDS = true;
   static constexpr bool FETCH_AND_STORE_DONGLE_IDS_DETAIL = true;
@@ -24,9 +25,7 @@ class DebugService {
   private:
     SemaphoreHandle_t _serialPrintMutex = nullptr;
 
-    static DebugService* _instance;
-
-    explicit DebugService();
+    DebugService();
 
     // Variadic print helpers (single + recursive)
     template<typename T>

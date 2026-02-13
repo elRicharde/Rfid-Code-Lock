@@ -58,10 +58,10 @@ void setup() {
   Serial.begin(115200);
   // Countdown for serial monitor connection
   for (int i = 5; i > 0; i--) {
-    DBG(true, i, " seconds", String(i == 1 ? "." : "...").c_str());
+    DBG(DebugFlags::SETUP, i, " seconds", (i == 1 ? "." : "..."));
     delay(1000);
   }
-  DBG(true, "Start!");
+  DBG(DebugFlags::SETUP, "Start!");
   #endif
 
   // Connect to WiFi (blocking, max 10 seconds — then continue without internet)
@@ -94,6 +94,7 @@ void setup() {
 
   // Create mutex before any task that uses the dongle list
   mutexDongleList = xSemaphoreCreateMutex();
+  configASSERT(mutexDongleList != nullptr);
 
   // Load dongles from NVS for immediate RFID availability (no HTTP needed)
   loadDonglesFromPersistentMemory();
@@ -118,7 +119,11 @@ void loop() {
   // If interference or a partial read leaves bitCount between 1-25, no further scans
   // can succeed because bitCount never reaches 26. A 200ms timeout is chosen to be
   // well above the maximum valid transmission time while still recovering quickly.
-  if (bitCount > 0 && bitCount < 26 && millis() - lastBitTime > WIEGAND_TIMEOUT_MS) {
+  noInterrupts();
+  int snapBitCount = bitCount;
+  unsigned long snapLastBitTime = lastBitTime;
+  interrupts();
+  if (snapBitCount > 0 && snapBitCount < 26 && millis() - snapLastBitTime > WIEGAND_TIMEOUT_MS) {
     noInterrupts();
     bitCount = 0;
     dongleValue = 0;
@@ -231,7 +236,10 @@ void handleRFIDScanResult() {
     enqueueLogEntry(logEntry);
   }
 
-  // Clear ISR state for next scan
+  // Clear ISR state for next scan.
+  // Note: if a new scan begins between our snapshot (above) and this reset,
+  // the new scan's bits are discarded. This is acceptable because human
+  // badge scans are seconds apart — the narrow race window (~ms) is benign.
   noInterrupts();
   bitCount = 0;
   dongleValue = 0;

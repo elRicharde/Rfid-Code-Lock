@@ -4,6 +4,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
+#include <atomic>
 
 // =============================================================
 // Shared State Definitions
@@ -18,7 +19,7 @@ QueueHandle_t buzzerSignalQueue = nullptr;
 // Internal State (file-scoped)
 // =============================================================
 static TaskHandle_t networkTaskHandle = nullptr;
-static volatile int droppedLogCount = 0;  // Acceptable as volatile: single-writer monitoring counter
+static std::atomic<int> droppedLogCount{0};  // Atomic: written on Core 1, read on Core 0
 static unsigned long lastDongleRefreshTime = 0;
 static unsigned long lastWifiReconnectCheck = 0;
 static unsigned long lastLogRetryTime = 0;
@@ -41,6 +42,8 @@ static void sendBuzzerSignal(BuzzerSignal signal);
 void startNetworkTask() {
   logQueue = xQueueCreate(LOG_QUEUE_SIZE, sizeof(LogEntryStruct));
   buzzerSignalQueue = xQueueCreate(1, sizeof(BuzzerSignal));
+  configASSERT(logQueue != nullptr);
+  configASSERT(buzzerSignalQueue != nullptr);
 
   xTaskCreatePinnedToCore(
     networkTaskLoop,
@@ -54,8 +57,10 @@ void startNetworkTask() {
 }
 
 void loadDonglesFromPersistentMemory() {
-  // Called from setup() on the main core before network task starts.
-  // No mutex needed yet because the network task hasn't been created.
+  // Must be called BEFORE startNetworkTask() — no mutex taken because
+  // the network task does not exist yet.
+  configASSERT(networkTaskHandle == nullptr);
+
   Preferences prefs;
   prefs.begin("dongleStore", true);  // ReadOnly = true
   String json = prefs.getString(PERS_MEM_DONGLE_IDS, "[]");
@@ -77,7 +82,7 @@ bool enqueueLogEntry(const LogEntryStruct& entry) {
   }
   if (xQueueSend(logQueue, &entry, 0) != pdTRUE) {
     droppedLogCount++;
-    DBG(DebugFlags::NETWORK_TASK, "Log queue full — entry dropped (total dropped: ", droppedLogCount, ")");
+    DBG(DebugFlags::NETWORK_TASK, "Log queue full — entry dropped (total: ", droppedLogCount.load(), ")");
     return false;
   }
   return true;
@@ -114,8 +119,9 @@ static void networkTaskLoop(void* param) {
     if (millis() - lastWifiReconnectCheck > WIFI_RECONNECT_INTERVAL_MS) {
       lastWifiReconnectCheck = millis();
       if (WiFi.status() != WL_CONNECTED) {
-        DBG(DebugFlags::WIFI_LOGGING, "WiFi disconnected, attempting reconnect...");
-        WiFi.reconnect();
+        DBG(DebugFlags::WIFI_LOGGING, "WiFi disconnected, reconnecting...");
+        WiFi.disconnect();
+        WiFi.begin(SSID, WIFI_PASSWORD);
       }
     }
 
@@ -127,14 +133,14 @@ static void networkTaskLoop(void* param) {
 
     // --- Dongle refresh: on-demand via xTaskNotify (MasterCard scan) ---
     uint32_t notifyValue;
-    if (xTaskNotifyWait(0, ULONG_MAX, &notifyValue, 0) == pdTRUE) {
+    if (xTaskNotifyWait(0, UINT32_MAX, &notifyValue, 0) == pdTRUE) {
       // Debounce: ignore requests within DONGLE_REFRESH_DEBOUNCE_MS of last refresh
       if (millis() - lastDongleRefreshTime > DONGLE_REFRESH_DEBOUNCE_MS) {
         DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "MasterCard triggered dongle refresh");
         fetchAndStoreDongleIds();
         lastDongleRefreshTime = millis();
       } else {
-        DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "MasterCard refresh debounced (within 30s cooldown)");
+        DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Refresh debounced (30s cooldown)");
       }
     }
 
@@ -155,17 +161,19 @@ static void networkTaskLoop(void* param) {
     }
 
     // --- Dropped log warning ---
-    if (droppedLogCount > 0) {
-      DBG(DebugFlags::NETWORK_TASK, "WARNING: ", droppedLogCount, " log entries dropped since startup");
+    int dropped = droppedLogCount.load();
+    if (dropped > 0) {
+      DBG(DebugFlags::NETWORK_TASK, "WARNING: ", dropped, " log entries dropped since startup");
     }
 
-    // --- Stack monitoring (debug only) ---
+    // --- Debug monitoring (stack + heap) ---
     #ifdef DEBUG_MODE
     {
-      static unsigned long lastStackCheck = 0;
-      if (millis() - lastStackCheck > 60000) {
-        lastStackCheck = millis();
+      static unsigned long lastMonitorCheck = 0;
+      if (millis() - lastMonitorCheck > 60000) {
+        lastMonitorCheck = millis();
         DBG(DebugFlags::NETWORK_TASK, "NetworkTask free stack: ", uxTaskGetStackHighWaterMark(nullptr), " words");
+        DBG(DebugFlags::NETWORK_TASK, "Free heap: ", ESP.getFreeHeap(), " min: ", ESP.getMinFreeHeap());
       }
     }
     #endif
@@ -183,21 +191,11 @@ static void fetchAndStoreDongleIds() {
 
   // --- Step 1: Read persisted dongles from NVS ---
   Preferences prefs;
-  prefs.begin("dongleStore", true);  // ReadOnly = true for reading
+  prefs.begin("dongleStore", true);  // ReadOnly = true
   String persJson = prefs.getString(PERS_MEM_DONGLE_IDS, "[]");
   prefs.end();
 
-  JsonDocument persDoc;
-  DeserializationError error = deserializeJson(persDoc, persJson);
-  if (error) {
-    DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Failed to deserialize persisted dongles: ", error.f_str());
-    persDoc.clear();
-    deserializeJson(persDoc, "[]");
-  }
-  JsonArray persArr = persDoc.as<JsonArray>();
-  DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Persistent dongles: ", persArr.size());
-
-  // --- Step 2: Fetch from Google Sheets (HTTP — outside mutex!) ---
+  // --- Step 2: Fetch from Google Sheets (outside mutex!) ---
   HTTPClient http;
   http.setTimeout(20000);
   http.begin(WEB_APP_URL_READ);
@@ -214,64 +212,51 @@ static void fetchAndStoreDongleIds() {
   String payload = http.getString();
   http.end();
 
-  // --- Step 3: Parse response (still outside mutex) ---
-  JsonDocument onlineDoc;
-  error = deserializeJson(onlineDoc, payload);
+  // --- Step 3: Validate response by parsing (still outside mutex) ---
+  JsonDocument validationDoc;
+  DeserializationError error = deserializeJson(validationDoc, payload);
   if (error) {
     DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Failed to deserialize online dongles: ", error.f_str());
     sendBuzzerSignal(BUZZER_SOS);
     return;
   }
-  JsonArray onlineArr = onlineDoc.as<JsonArray>();
 
   #ifdef DEBUG_MODE
   if (DebugFlags::FETCH_AND_STORE_DONGLE_IDS_DETAIL) {
-    for (JsonVariant v : onlineArr) {
+    JsonArray debugArr = validationDoc.as<JsonArray>();
+    for (JsonVariant v : debugArr) {
       DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS_DETAIL, "  online: ", v.as<String>());
     }
   }
   #endif
 
   // --- Step 4: Compare online vs. persisted ---
-  bool isDifferent = false;
-  if (persArr.size() != onlineArr.size()) {
-    isDifferent = true;
-    DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Size diff: ", persArr.size(), " vs ", onlineArr.size());
-  } else {
-    for (JsonVariant v : onlineArr) {
-      vTaskDelay(1);  // Yield to prevent watchdog reset on large lists
-      if (!arrayContains(persArr, v)) {
-        DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Diff: ", v.as<String>(), " not in persisted");
-        isDifferent = true;
-        break;
-      }
-    }
+  // Simple string comparison of raw JSON payloads. The Google Script returns
+  // deterministic JSON, and persJson is the raw payload from the previous fetch.
+  bool isDifferent = (payload != persJson);
+  if (isDifferent) {
+    DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Online data differs from persisted");
   }
 
-  // --- Step 5: Update NVS if different (outside mutex — NVS is not thread-safe, but
-  //     confined to this task only, so no concurrent NVS access is possible) ---
+  // --- Step 5: Update NVS if different (NVS confined to this task — no concurrent access) ---
   if (isDifferent) {
     Preferences prefsWrite;
     prefsWrite.begin("dongleStore", false);
-    prefsWrite.clear();
-    prefsWrite.putString(PERS_MEM_DONGLE_IDS, payload);
+    prefsWrite.putString(PERS_MEM_DONGLE_IDS, payload);  // Overwrite directly, no clear() needed
     prefsWrite.end();
     DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "NVS updated with new dongle list");
   }
 
-  // --- Step 6: Update RAM array (mutex ONLY during the brief swap) ---
+  // --- Step 6: Pre-parse JSON outside mutex, then swap inside (brief critical section) ---
+  JsonDocument newDoc;
+  deserializeJson(newDoc, isDifferent ? payload : persJson);
+
   if (xSemaphoreTake(mutexDongleList, pdMS_TO_TICKS(100)) == pdTRUE) {
-    ramDonglesDoc.clear();
-    if (isDifferent) {
-      // Use the fresh online data
-      deserializeJson(ramDonglesDoc, payload);
-    } else {
-      // No change — ensure RAM is populated (covers cold-start with matching NVS)
-      deserializeJson(ramDonglesDoc, persJson);
-    }
+    ramDonglesDoc = std::move(newDoc);
     ramDonglesArr = ramDonglesDoc.as<JsonArray>();
+    int newSize = ramDonglesArr.size();  // Capture inside mutex before releasing
     xSemaphoreGive(mutexDongleList);
-    DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "RAM updated: ", ramDonglesArr.size(), " dongles");
+    DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "RAM updated: ", newSize, " dongles");
   } else {
     DBG(DebugFlags::FETCH_AND_STORE_DONGLE_IDS, "Mutex timeout during RAM update!");
   }
@@ -285,13 +270,17 @@ static void fetchAndStoreDongleIds() {
 
 static bool sendLogEntryViaHttp(const LogEntryStruct& entry) {
   HTTPClient http;
-  String url = String(WEB_APP_URL) + "?action=write_log_pa";
-  url += "&date=" + urlEncode(String(entry.date));
-  url += "&time=" + urlEncode(String(entry.time));
-  url += "&access=" + urlEncode(String(entry.access));
-  url += "&dongle_id=" + urlEncode(String(entry.dongle_id));
+  String url;
+  url.reserve(256);  // Pre-allocate to reduce heap fragmentation
+  url = WEB_APP_URL;
+  url += "?action=write_log_pa";
+  url += "&date="; url += urlEncode(String(entry.date));
+  url += "&time="; url += urlEncode(String(entry.time));
+  url += "&access="; url += urlEncode(String(entry.access));
+  url += "&dongle_id="; url += urlEncode(String(entry.dongle_id));
 
   http.begin(url);
+  http.setTimeout(20000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   int httpCode = http.GET();
   http.end();
@@ -331,6 +320,14 @@ static bool sendStoredLogEntries() {
       int c1 = csv.indexOf(',');
       int c2 = csv.indexOf(',', c1 + 1);
       int c3 = csv.indexOf(',', c2 + 1);
+
+      // Validate CSV structure — malformed entries are removed
+      if (c1 < 0 || c2 < 0 || c3 < 0) {
+        DBG(DebugFlags::SEND_STORED_LOG_ENTRIES, "Malformed CSV entry removed: ", key);
+        prefsLog.remove(key.c_str());
+        keyArray.remove(i);
+        continue;
+      }
 
       LogEntryStruct entry;
       safeCopyStringToChar(csv.substring(0, c1), entry.date, CharArrayDateSize);
@@ -383,21 +380,19 @@ static void saveFailedLogEntry(const LogEntryStruct& entry) {
   }
   JsonArray keyArray = doc.as<JsonArray>();
 
-  // Generate a unique key
-  String newKey;
-  int keyIndex = keyArray.size();
-  bool keyExists = true;
-  while (keyExists) {
-    keyExists = false;
-    keyIndex++;
-    newKey = "log" + String(keyIndex);
-    for (int i = 0; i < (int)keyArray.size(); i++) {
-      if (keyArray[i].as<String>() == newKey) {
-        keyExists = true;
-        break;
-      }
-    }
+  // Enforce maximum stored log count to prevent NVS partition exhaustion.
+  // Oldest entries are discarded first (FIFO).
+  while ((int)keyArray.size() >= MAX_FAILED_LOGS) {
+    String oldestKey = keyArray[0].as<String>();
+    prefsLog.remove(oldestKey.c_str());
+    keyArray.remove(0);
+    DBG(DebugFlags::SEND_STORED_LOG_ENTRIES, "NVS full — discarded oldest log: ", oldestKey);
   }
+
+  // Generate unique key using monotonic counter (avoids O(n^2) search)
+  int nextIndex = prefsLog.getInt("nextIdx", 1);
+  String newKey = "log" + String(nextIndex);
+  prefsLog.putInt("nextIdx", nextIndex + 1);
 
   String csv = String(entry.date) + "," + String(entry.time) + "," + String(entry.access) + "," + String(entry.dongle_id);
   prefsLog.putString(newKey.c_str(), csv);
